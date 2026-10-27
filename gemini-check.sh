@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Проверяет, подходит ли IP сервера или прокси для Gemini.
 #
-# Интерактивно (спросит прокси и ключ API): команда запуска из README
+# Интерактивно (спросит прокси и ключ API):
+#   bash <(curl -fsSL https://raw.githubusercontent.com/4jj2gp42m7-prog/gemini-check/main/gemini-check.sh)
 #
 # Без вопросов:
 #   gemini-check.sh                                   IP этого сервера
