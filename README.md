@@ -8,10 +8,13 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/4jj2gp42m7-prog/gemini-check/main/gemini-check.sh)
 ```
 
-Скрипт спросит:
+Скрипт сам определит внешний IPv4 сервера и спросит только **ключ API Gemini** (Enter — пропустить). Ключ бесплатно выдаёт [AI Studio](https://aistudio.google.com/apikey). Ввод скрыт, ключ уходит только в Google.
 
-1. **Что проверять.** Enter — IP этого сервера. Или вставьте прокси: `socks5h://логин:пароль@хост:порт`.
-2. **Ключ API Gemini.** Enter — пропустить. Ключ бесплатно выдаёт [AI Studio](https://aistudio.google.com/apikey). Ввод скрыт, ключ уходит только в Google.
+Чтобы проверить прокси, допишите его в конец команды:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/4jj2gp42m7-prog/gemini-check/main/gemini-check.sh) socks5h://логин:пароль@хост:порт
+```
 
 ## Установить командой `gemini-check`
 
@@ -23,7 +26,7 @@ curl -fsSL https://raw.githubusercontent.com/4jj2gp42m7-prog/gemini-check/main/g
 
 | Команда | Что делает |
 |---|---|
-| `gemini-check` | спросит, что проверять, и ключ |
+| `gemini-check` | проверит IPv4 сервера, спросит только ключ API (Enter — пропустить) |
 | `gemini-check socks5h://логин:пароль@хост:порт` | проверит прокси без вопросов |
 | `GEMINI_KEY=ключ gemini-check` | проверит IP сервера вместе с API Gemini |
 | `GEMINI_KEY=- gemini-check` | проверит IP сервера без API и без вопросов |

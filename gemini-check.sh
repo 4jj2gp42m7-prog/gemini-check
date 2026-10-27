@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # Проверяет, подходит ли IP сервера или прокси для Gemini.
 #
-# Интерактивно (спросит прокси и ключ API):
+# Проверить IPv4 этого сервера (спросит только ключ API, Enter — пропустить):
 #   bash <(curl -fsSL https://raw.githubusercontent.com/4jj2gp42m7-prog/gemini-check/main/gemini-check.sh)
 #
 # Без вопросов:
-#   gemini-check.sh                                   IP этого сервера
 #   gemini-check.sh socks5h://логин:пароль@хост:порт  IP прокси
 #   GEMINI_KEY=ключ gemini-check.sh                   плюс проверка через API Gemini
 #   GEMINI_KEY=- gemini-check.sh                      без API и без вопроса о ключе
@@ -23,15 +22,7 @@ ask() {
 }
 
 PROXY="$1"
-INTERACTIVE=0
-if [ -z "$PROXY" ] && [ -z "$GEMINI_KEY" ] && [ -r /dev/tty ]; then INTERACTIVE=1; fi
-
-if [ "$INTERACTIVE" = 1 ]; then
-  echo "Что проверяем?"
-  echo "  Enter — IP этого сервера"
-  echo "  или вставьте прокси: socks5h://логин:пароль@хост:порт"
-  PROXY=$(ask "> ")
-  echo
+if [ -z "$PROXY" ] && [ -z "$GEMINI_KEY" ] && [ -r /dev/tty ]; then
   echo "Ключ API Gemini для самой точной проверки (aistudio.google.com/apikey)."
   echo "  Enter — пропустить. Ввод скрыт."
   GEMINI_KEY=$(ask "> " 1)
@@ -39,7 +30,8 @@ if [ "$INTERACTIVE" = 1 ]; then
 fi
 [ "$GEMINI_KEY" = "-" ] && GEMINI_KEY=""
 
-if [ -n "$PROXY" ]; then NET=(-x "$PROXY"); WHAT="прокси ${PROXY##*@}"; else NET=(-4); WHAT="этот сервер"; fi
+# Без аргумента проверяем внешний IPv4 самого сервера
+if [ -n "$PROXY" ]; then NET=(-x "$PROXY"); WHAT="прокси ${PROXY##*@}"; else NET=(-4); WHAT="IPv4 этого сервера"; fi
 C() { curl -s --max-time 20 "${NET[@]}" "$@"; }
 jfield() { grep -o "\"$1\": *\"[^\"]*\"" | head -1 | cut -d'"' -f4; }
 
