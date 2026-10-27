@@ -9,7 +9,7 @@
 #   GEMINI_KEY=ключ gemini-check.sh                   плюс проверка через API Gemini
 #   GEMINI_KEY=- gemini-check.sh                      без API и без вопроса о ключе
 
-VERSION="1.4"
+VERSION="1.5"
 BLOCKED="RU BY CN HK MO IR KP CU SY"
 
 # Вопрос пользователю: читаем с терминала, даже если скрипт пришёл через pipe
@@ -91,10 +91,24 @@ if [ -n "$GEMINI_KEY" ]; then
     if [ -z "$S" ] || [ "$S" = "$M" ]; then break; fi
     M=$S; gen "$M"
   done
+  # Модель перегружена (503) или кончился лимит (429): пробуем другие flash-модели
+  if ! echo "$R" | grep -qiE '"candidates"|location is not supported' && { [ "$CODE" = 503 ] || [ "$CODE" = 429 ]; }; then
+    for ALT in $(C -H "x-goog-api-key: $GEMINI_KEY" "$BASE/models?pageSize=1000" \
+        | grep -o '"models/gemini-[0-9][^"]*flash[^"]*"' | tr -d '"' \
+        | grep -vE 'tts|image|live|audio|embed' | sort -V -r | grep -vxF "$M" | head -3); do
+      sleep 2
+      M=$ALT; gen "$M"
+      echo "$R" | grep -qiE '"candidates"|location is not supported' && break
+    done
+  fi
   if echo "$R" | grep -q '"candidates"'; then
     API=ok; echo "  API Gemini:            отвечает (${M#models/})"
   elif echo "$R" | grep -qi 'location is not supported'; then
     API=blocked; echo "  API Gemini:            ОТКАЗ по стране (User location is not supported)"
+  elif [ "$CODE" = 503 ]; then
+    API=accepted; echo "  API Gemini:            ключ и страна приняты, но модели сейчас перегружены (HTTP 503)"
+  elif [ "$CODE" = 429 ]; then
+    API=accepted; echo "  API Gemini:            ключ и страна приняты, но исчерпан лимит запросов (HTTP 429)"
   else
     MSG=$(echo "$R" | jfield message)
     [ -z "$MSG" ] && MSG=$(echo "$R" | tr -s ' \n\t' ' ' | cut -c1-200)
@@ -113,6 +127,8 @@ elif [[ " $BLOCKED " == *" $GL "* ]]; then
   echo "ИТОГ: НЕ ПОДХОДИТ. Google считает этот IP: $GL"
 elif [ "$API" = ok ]; then
   echo "ИТОГ: ПОДХОДИТ. YouTube видит $GL, API Gemini отвечает"
+elif [ "$API" = accepted ]; then
+  echo "ИТОГ: ПОДХОДИТ. YouTube видит $GL, API Gemini принимает запросы из этой страны"
 else
   echo "ИТОГ: ПОДХОДИТ. YouTube видит $GL"
 fi
