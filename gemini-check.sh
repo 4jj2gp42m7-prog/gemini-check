@@ -9,7 +9,7 @@
 #   GEMINI_KEY=ключ gemini-check.sh                   плюс проверка через API Gemini
 #   GEMINI_KEY=- gemini-check.sh                      без API и без вопроса о ключе
 
-VERSION="1.3"
+VERSION="1.4"
 BLOCKED="RU BY CN HK MO IR KP CU SY"
 
 # Вопрос пользователю: читаем с терминала, даже если скрипт пришёл через pipe
@@ -67,14 +67,19 @@ echo "  Сайт Gemini:           HTTP ${GEM_CODE:-нет ответа}"
 API=""
 if [ -n "$GEMINI_KEY" ]; then
   BASE="https://generativelanguage.googleapis.com/v1beta"
+  # Запрос к модели. Новые модели перед ответом «думают», поэтому ждём до 60 секунд.
+  # Ответ кладём в R, HTTP-код в CODE.
   gen() {
-    C -H "x-goog-api-key: $GEMINI_KEY" -H 'Content-Type: application/json' \
-      -d '{"contents":[{"parts":[{"text":"Say OK"}]}]}' "$BASE/$1:generateContent"
+    local out
+    out=$(curl -s --max-time 60 "${NET[@]}" -w '\n%{http_code}' \
+      -H "x-goog-api-key: $GEMINI_KEY" -H 'Content-Type: application/json' \
+      -d '{"contents":[{"parts":[{"text":"Say OK"}]}]}' "$BASE/$1:generateContent")
+    CODE=${out##*$'\n'}; R=${out%$'\n'*}
   }
   # Сначала псевдоним последней flash-модели. Если его нет или модель сняли,
   # берём ту, что советует сам API, иначе самую новую flash из списка.
   M=models/gemini-flash-latest
-  R=$(gen "$M")
+  gen "$M"
   for _ in 1 2 3; do
     echo "$R" | grep -qiE '"candidates"|location is not supported' && break
     S=$(echo "$R" | grep -o 'use models/gemini-[^ ,"]*' | head -1 | sed 's/^use //; s/\.$//')
@@ -84,14 +89,17 @@ if [ -n "$GEMINI_KEY" ]; then
         | grep -vE 'tts|image|live|audio|embed|preview|exp|lite' | sort -V -r | head -1)
     fi
     if [ -z "$S" ] || [ "$S" = "$M" ]; then break; fi
-    M=$S; R=$(gen "$M")
+    M=$S; gen "$M"
   done
   if echo "$R" | grep -q '"candidates"'; then
     API=ok; echo "  API Gemini:            отвечает (${M#models/})"
   elif echo "$R" | grep -qi 'location is not supported'; then
     API=blocked; echo "  API Gemini:            ОТКАЗ по стране (User location is not supported)"
   else
-    echo "  API Gemini:            ошибка: $(echo "$R" | jfield message)"
+    MSG=$(echo "$R" | jfield message)
+    [ -z "$MSG" ] && MSG=$(echo "$R" | tr -s ' \n\t' ' ' | cut -c1-200)
+    [ "$CODE" = 000 ] && MSG="нет ответа за 60 секунд"
+    echo "  API Gemini:            ошибка (${M#models/}, HTTP ${CODE:-?}): ${MSG:-пустой ответ}"
   fi
 fi
 
