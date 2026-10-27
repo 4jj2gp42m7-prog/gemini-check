@@ -9,6 +9,7 @@
 #   GEMINI_KEY=ключ gemini-check.sh                   плюс проверка через API Gemini
 #   GEMINI_KEY=- gemini-check.sh                      без API и без вопроса о ключе
 
+VERSION="1.3"
 BLOCKED="RU BY CN HK MO IR KP CU SY"
 
 # Вопрос пользователю: читаем с терминала, даже если скрипт пришёл через pipe
@@ -35,7 +36,7 @@ if [ -n "$PROXY" ]; then NET=(-x "$PROXY"); WHAT="прокси ${PROXY##*@}"; el
 C() { curl -s --max-time 20 "${NET[@]}" "$@"; }
 jfield() { grep -o "\"$1\": *\"[^\"]*\"" | head -1 | cut -d'"' -f4; }
 
-echo "Проверяем: $WHAT"
+echo "Проверяем: $WHAT   (gemini-check $VERSION)"
 echo
 
 # 1. IP и провайдер по обычным геобазам
@@ -74,15 +75,17 @@ if [ -n "$GEMINI_KEY" ]; then
   # берём ту, что советует сам API, иначе самую новую flash из списка.
   M=models/gemini-flash-latest
   R=$(gen "$M")
-  if ! echo "$R" | grep -qiE '"candidates"|location is not supported'; then
+  for _ in 1 2 3; do
+    echo "$R" | grep -qiE '"candidates"|location is not supported' && break
     S=$(echo "$R" | grep -o 'use models/gemini-[^ ,"]*' | head -1 | sed 's/^use //; s/\.$//')
     if [ -z "$S" ]; then
       S=$(C -H "x-goog-api-key: $GEMINI_KEY" "$BASE/models?pageSize=1000" \
         | grep -o '"models/gemini-[0-9][^"]*flash[^"]*"' | tr -d '"' \
         | grep -vE 'tts|image|live|audio|embed|preview|exp|lite' | sort -V -r | head -1)
     fi
-    if [ -n "$S" ] && [ "$S" != "$M" ]; then M=$S; R=$(gen "$M"); fi
-  fi
+    if [ -z "$S" ] || [ "$S" = "$M" ]; then break; fi
+    M=$S; R=$(gen "$M")
+  done
   if echo "$R" | grep -q '"candidates"'; then
     API=ok; echo "  API Gemini:            отвечает (${M#models/})"
   elif echo "$R" | grep -qi 'location is not supported'; then
