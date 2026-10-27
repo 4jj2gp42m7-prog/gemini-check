@@ -9,7 +9,7 @@
 #   GEMINI_KEY=ключ gemini-check.sh                   плюс проверка через API Gemini
 #   GEMINI_KEY=- gemini-check.sh                      без API и без вопроса о ключе
 
-VERSION="1.5"
+VERSION="1.6"
 BLOCKED="RU BY CN HK MO IR KP CU SY"
 
 # Вопрос пользователю: читаем с терминала, даже если скрипт пришёл через pipe
@@ -67,52 +67,65 @@ echo "  Сайт Gemini:           HTTP ${GEM_CODE:-нет ответа}"
 API=""
 if [ -n "$GEMINI_KEY" ]; then
   BASE="https://generativelanguage.googleapis.com/v1beta"
-  # Запрос к модели. Новые модели перед ответом «думают», поэтому ждём до 60 секунд.
-  # Ответ кладём в R, HTTP-код в CODE.
-  gen() {
-    local out
-    out=$(curl -s --max-time 60 "${NET[@]}" -w '\n%{http_code}' \
+  TIMEOUT=40
+  TRIED=" "; BUSY=""; LIMIT=""
+  # Запрос к модели: ответ в R, HTTP-код в CODE, строка о попытке на экран
+  try() {
+    local out note
+    M=$1; TRIED="$TRIED$1 "
+    printf '    · %-34s ' "${1#models/}"
+    out=$(curl -s --max-time "$TIMEOUT" "${NET[@]}" -w '\n%{http_code}' \
       -H "x-goog-api-key: $GEMINI_KEY" -H 'Content-Type: application/json' \
       -d '{"contents":[{"parts":[{"text":"Say OK"}]}]}' "$BASE/$1:generateContent")
     CODE=${out##*$'\n'}; R=${out%$'\n'*}
+    case "$CODE" in
+      200) note="ответ получен" ;;
+      503) note="перегружена"; BUSY=1 ;;
+      429) note="лимит запросов"; LIMIT=1 ;;
+      000) note="нет ответа за $TIMEOUT с" ;;
+      404) note="недоступна" ;;
+      *)   note="HTTP $CODE" ;;
+    esac
+    echo "$R" | grep -qi 'location is not supported' && note="отказ по стране"
+    echo "$note"
   }
-  # Сначала псевдоним последней flash-модели. Если его нет или модель сняли,
-  # берём ту, что советует сам API, иначе самую новую flash из списка.
-  M=models/gemini-flash-latest
-  gen "$M"
+  answered() { echo "$R" | grep -qiE '"candidates"|location is not supported'; }
+  tried() { [[ "$TRIED" == *" $1 "* ]]; }
+
+  echo "  API Gemini, попытки:"
+  # Последняя flash-модель; если её сняли, идём туда, куда советует сам API
+  try models/gemini-flash-latest
   for _ in 1 2 3; do
-    echo "$R" | grep -qiE '"candidates"|location is not supported' && break
+    answered && break
     S=$(echo "$R" | grep -o 'use models/gemini-[^ ,"]*' | head -1 | sed 's/^use //; s/\.$//')
-    if [ -z "$S" ]; then
-      S=$(C -H "x-goog-api-key: $GEMINI_KEY" "$BASE/models?pageSize=1000" \
-        | grep -o '"models/gemini-[0-9][^"]*flash[^"]*"' | tr -d '"' \
-        | grep -vE 'tts|image|live|audio|embed|preview|exp|lite' | sort -V -r | head -1)
-    fi
-    if [ -z "$S" ] || [ "$S" = "$M" ]; then break; fi
-    M=$S; gen "$M"
+    if [ -z "$S" ] || tried "$S"; then break; fi
+    try "$S"
   done
-  # Модель перегружена (503) или кончился лимит (429): пробуем другие flash-модели
-  if ! echo "$R" | grep -qiE '"candidates"|location is not supported' && { [ "$CODE" = 503 ] || [ "$CODE" = 429 ]; }; then
-    for ALT in $(C -H "x-goog-api-key: $GEMINI_KEY" "$BASE/models?pageSize=1000" \
+  # Перегрузка, лимит, тайм-аут или модель недоступна: до трёх лёгких и других flash-моделей
+  if ! answered; then
+    n=0
+    for ALT in models/gemini-flash-lite-latest $(C -H "x-goog-api-key: $GEMINI_KEY" "$BASE/models?pageSize=1000" \
         | grep -o '"models/gemini-[0-9][^"]*flash[^"]*"' | tr -d '"' \
-        | grep -vE 'tts|image|live|audio|embed' | sort -V -r | grep -vxF "$M" | head -3); do
-      sleep 2
-      M=$ALT; gen "$M"
-      echo "$R" | grep -qiE '"candidates"|location is not supported' && break
+        | grep -vE 'tts|image|live|audio|embed' | sort -V -r); do
+      tried "$ALT" && continue
+      n=$((n + 1)); [ "$n" -gt 3 ] && break
+      try "$ALT"
+      answered && break
     done
   fi
+
   if echo "$R" | grep -q '"candidates"'; then
     API=ok; echo "  API Gemini:            отвечает (${M#models/})"
   elif echo "$R" | grep -qi 'location is not supported'; then
     API=blocked; echo "  API Gemini:            ОТКАЗ по стране (User location is not supported)"
-  elif [ "$CODE" = 503 ]; then
-    API=accepted; echo "  API Gemini:            ключ и страна приняты, но модели сейчас перегружены (HTTP 503)"
-  elif [ "$CODE" = 429 ]; then
-    API=accepted; echo "  API Gemini:            ключ и страна приняты, но исчерпан лимит запросов (HTTP 429)"
+  elif [ -n "$BUSY" ]; then
+    API=accepted; echo "  API Gemini:            ключ и страна приняты, но модели перегружены. Повторите позже"
+  elif [ -n "$LIMIT" ]; then
+    API=accepted; echo "  API Gemini:            ключ и страна приняты, но исчерпан лимит запросов"
   else
     MSG=$(echo "$R" | jfield message)
     [ -z "$MSG" ] && MSG=$(echo "$R" | tr -s ' \n\t' ' ' | cut -c1-200)
-    [ "$CODE" = 000 ] && MSG="нет ответа за 60 секунд"
+    [ "$CODE" = 000 ] && MSG="нет ответа за $TIMEOUT секунд"
     echo "  API Gemini:            ошибка (${M#models/}, HTTP ${CODE:-?}): ${MSG:-пустой ответ}"
   fi
 fi
