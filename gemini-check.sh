@@ -9,7 +9,7 @@
 #   GEMINI_KEY=ключ gemini-check.sh                   плюс проверка через API Gemini
 #   GEMINI_KEY=- gemini-check.sh                      без API и без вопроса о ключе
 
-VERSION="1.6"
+VERSION="1.7"
 BLOCKED="RU BY CN HK MO IR KP CU SY"
 
 # Вопрос пользователю: читаем с терминала, даже если скрипт пришёл через pipe
@@ -59,74 +59,64 @@ YT=$(C -L -b 'SOCS=CAI' -H 'Accept-Language: en-US,en;q=0.9' https://www.youtube
 GL=$(echo "$YT" | grep -o '"GL":"[A-Z]*"' | head -1 | cut -d'"' -f4)
 echo "  YouTube показывает:    ${GL:-не удалось определить}"
 
-# 3. Открывается ли сайт Gemini
+# 3. Есть ли сетевой доступ к gemini.google.com. Страну этот пункт не проверяет:
+#    сайт отвечает 200 и там, где Gemini недоступен
 GEM_CODE=$(C -o /dev/null -w '%{http_code}' -A 'Mozilla/5.0' https://gemini.google.com/)
-echo "  Сайт Gemini:           HTTP ${GEM_CODE:-нет ответа}"
+if [ "$GEM_CODE" = 200 ]; then GEM_NOTE="есть (страну не проверяет)"; else GEM_NOTE="нет (HTTP ${GEM_CODE:-000})"; fi
+echo "  Связь с gemini.google: $GEM_NOTE"
 
-# 4. Ответ самого Gemini через API (если дали ключ)
+# 4. Ответ самого Gemini через API (если дали ключ): лёгкие модели параллельно, не дольше 10 секунд
 API=""
 if [ -n "$GEMINI_KEY" ]; then
   BASE="https://generativelanguage.googleapis.com/v1beta"
-  TIMEOUT=40
-  TRIED=" "; BUSY=""; LIMIT=""
-  # Запрос к модели: ответ в R, HTTP-код в CODE, строка о попытке на экран
-  try() {
-    local out note
-    M=$1; TRIED="$TRIED$1 "
-    printf '    · %-34s ' "${1#models/}"
-    out=$(curl -s --max-time "$TIMEOUT" "${NET[@]}" -w '\n%{http_code}' \
-      -H "x-goog-api-key: $GEMINI_KEY" -H 'Content-Type: application/json' \
-      -d '{"contents":[{"parts":[{"text":"Say OK"}]}]}' "$BASE/$1:generateContent")
-    CODE=${out##*$'\n'}; R=${out%$'\n'*}
-    case "$CODE" in
-      200) note="ответ получен" ;;
-      503) note="перегружена"; BUSY=1 ;;
-      429) note="лимит запросов"; LIMIT=1 ;;
-      000) note="нет ответа за $TIMEOUT с" ;;
-      404) note="недоступна" ;;
-      *)   note="HTTP $CODE" ;;
-    esac
-    echo "$R" | grep -qi 'location is not supported' && note="отказ по стране"
-    echo "$note"
-  }
-  answered() { echo "$R" | grep -qiE '"candidates"|location is not supported'; }
-  tried() { [[ "$TRIED" == *" $1 "* ]]; }
-
-  echo "  API Gemini, попытки:"
-  # Последняя flash-модель; если её сняли, идём туда, куда советует сам API
-  try models/gemini-flash-latest
-  for _ in 1 2 3; do
-    answered && break
-    S=$(echo "$R" | grep -o 'use models/gemini-[^ ,"]*' | head -1 | sed 's/^use //; s/\.$//')
-    if [ -z "$S" ] || tried "$S"; then break; fi
-    try "$S"
-  done
-  # Перегрузка, лимит, тайм-аут или модель недоступна: до трёх лёгких и других flash-моделей
-  if ! answered; then
-    n=0
-    for ALT in models/gemini-flash-lite-latest $(C -H "x-goog-api-key: $GEMINI_KEY" "$BASE/models?pageSize=1000" \
-        | grep -o '"models/gemini-[0-9][^"]*flash[^"]*"' | tr -d '"' \
-        | grep -vE 'tts|image|live|audio|embed' | sort -V -r); do
-      tried "$ALT" && continue
-      n=$((n + 1)); [ "$n" -gt 3 ] && break
-      try "$ALT"
-      answered && break
-    done
-  fi
-
-  if echo "$R" | grep -q '"candidates"'; then
-    API=ok; echo "  API Gemini:            отвечает (${M#models/})"
-  elif echo "$R" | grep -qi 'location is not supported'; then
+  OUT=$(curl -s --max-time 15 "${NET[@]}" -w '\n%{http_code}' -H "x-goog-api-key: $GEMINI_KEY" "$BASE/models?pageSize=1000")
+  LCODE=${OUT##*$'\n'}; LIST=${OUT%$'\n'*}
+  if echo "$LIST" | grep -qi 'location is not supported'; then
     API=blocked; echo "  API Gemini:            ОТКАЗ по стране (User location is not supported)"
-  elif [ -n "$BUSY" ]; then
-    API=accepted; echo "  API Gemini:            ключ и страна приняты, но модели перегружены. Повторите позже"
-  elif [ -n "$LIMIT" ]; then
-    API=accepted; echo "  API Gemini:            ключ и страна приняты, но исчерпан лимит запросов"
+  elif [ "$LCODE" != 200 ]; then
+    echo "  API Gemini:            ошибка списка моделей (HTTP $LCODE): $(echo "$LIST" | jfield message)"
   else
-    MSG=$(echo "$R" | jfield message)
-    [ -z "$MSG" ] && MSG=$(echo "$R" | tr -s ' \n\t' ' ' | cut -c1-200)
-    [ "$CODE" = 000 ] && MSG="нет ответа за $TIMEOUT секунд"
-    echo "  API Gemini:            ошибка (${M#models/}, HTTP ${CODE:-?}): ${MSG:-пустой ответ}"
+    # Только лёгкие модели, они меньше всего нагружены: «последняя» flash-lite и две самые новые flash-lite
+    NAMES=$(echo "$LIST" | grep -o '"models/gemini-[^"]*"' | tr -d '"' | grep -vE 'tts|image|live|audio|embed|customtools')
+    MODELS=$( { echo "$NAMES" | grep -x 'models/gemini-flash-lite-latest'
+                echo "$NAMES" | grep -E 'gemini-[0-9][0-9.]*-flash-lite(-preview)?$' | sort -V -r | head -2
+              } | awk 'NF && !seen[$0]++' | head -3 )
+    TMP=$(mktemp -d)
+    i=0
+    for m in $MODELS; do
+      i=$((i + 1))
+      curl -s --max-time 10 "${NET[@]}" -w '\n%{http_code}' -o "$TMP/$i.body" \
+        -H "x-goog-api-key: $GEMINI_KEY" -H 'Content-Type: application/json' \
+        -d '{"contents":[{"parts":[{"text":"Hi"}]}],"generationConfig":{"maxOutputTokens":8}}' \
+        "$BASE/$m:generateContent" > "$TMP/$i.code" 2>/dev/null &
+    done
+    wait
+    echo "  API Gemini, модели:"
+    i=0; OKM=""; BUSY=""
+    for m in $MODELS; do
+      i=$((i + 1))
+      CODE=$(tr -d '\n' < "$TMP/$i.code"); BODY=$(cat "$TMP/$i.body" 2>/dev/null)
+      case "$CODE" in
+        200) note="отвечает"; OKM=${OKM:-$m} ;;
+        503) note="перегружена"; BUSY=1 ;;
+        429) note="лимит запросов"; BUSY=1 ;;
+        404) note="недоступна для этого ключа" ;;
+        000|"") note="не ответила за 10 с" ;;
+        *)   note="HTTP $CODE: $(echo "$BODY" | jfield message | cut -c1-80)" ;;
+      esac
+      echo "$BODY" | grep -qi 'location is not supported' && { note="отказ по стране"; API=blocked; }
+      printf '    · %-34s %s\n' "${m#models/}" "$note"
+    done
+    rm -rf "$TMP"
+    if [ "$API" = blocked ]; then
+      echo "  API Gemini:            ОТКАЗ по стране (User location is not supported)"
+    elif [ -n "$OKM" ]; then
+      API=ok; echo "  API Gemini:            отвечает (${OKM#models/})"
+    elif [ -n "$BUSY" ]; then
+      API=accepted; echo "  API Gemini:            ключ и страна приняты, но модели сейчас заняты"
+    else
+      echo "  API Gemini:            модели не ответили, по API не проверено"
+    fi
   fi
 fi
 
