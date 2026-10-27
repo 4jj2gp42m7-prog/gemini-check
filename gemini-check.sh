@@ -66,10 +66,23 @@ echo "  Сайт Gemini:           HTTP ${GEM_CODE:-нет ответа}"
 API=""
 if [ -n "$GEMINI_KEY" ]; then
   BASE="https://generativelanguage.googleapis.com/v1beta"
-  M=$(C -H "x-goog-api-key: $GEMINI_KEY" "$BASE/models" | grep -o '"models/gemini[^"]*flash[^"]*"' | grep -vE 'tts|image|live|audio|embed' | head -1 | tr -d '"')
-  R=$(C -H "x-goog-api-key: $GEMINI_KEY" -H 'Content-Type: application/json' \
-        -d '{"contents":[{"parts":[{"text":"Say OK"}]}]}' \
-        "$BASE/${M:-models/gemini-flash-latest}:generateContent")
+  gen() {
+    C -H "x-goog-api-key: $GEMINI_KEY" -H 'Content-Type: application/json' \
+      -d '{"contents":[{"parts":[{"text":"Say OK"}]}]}' "$BASE/$1:generateContent"
+  }
+  # Сначала псевдоним последней flash-модели. Если его нет или модель сняли,
+  # берём ту, что советует сам API, иначе самую новую flash из списка.
+  M=models/gemini-flash-latest
+  R=$(gen "$M")
+  if ! echo "$R" | grep -qiE '"candidates"|location is not supported'; then
+    S=$(echo "$R" | grep -o 'use models/gemini-[^ ,"]*' | head -1 | sed 's/^use //; s/\.$//')
+    if [ -z "$S" ]; then
+      S=$(C -H "x-goog-api-key: $GEMINI_KEY" "$BASE/models?pageSize=1000" \
+        | grep -o '"models/gemini-[0-9][^"]*flash[^"]*"' | tr -d '"' \
+        | grep -vE 'tts|image|live|audio|embed|preview|exp|lite' | sort -V -r | head -1)
+    fi
+    if [ -n "$S" ] && [ "$S" != "$M" ]; then M=$S; R=$(gen "$M"); fi
+  fi
   if echo "$R" | grep -q '"candidates"'; then
     API=ok; echo "  API Gemini:            отвечает (${M#models/})"
   elif echo "$R" | grep -qi 'location is not supported'; then
