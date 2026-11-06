@@ -411,7 +411,7 @@ class BrowserPageTests(unittest.TestCase):
         with patch("playwright.sync_api.sync_playwright", return_value=Driver()), \
                 patch.dict(os.environ, {"GEMINI_KEY": "private-key-not-for-browser",
                                         "HTTPS_PROXY": "http://unexpected.invalid:8080"}):
-            result = self.namespace["probe_browser"](timeout=5)
+            result = self.namespace["_probe_browser_session"](timeout=5)
         self.assertEqual(result["status"], "working", result)
         self.assertEqual(result["ip"], "203.0.113.73")
         self.assertEqual(result["country"], "DE")
@@ -439,7 +439,7 @@ class BrowserCliTests(unittest.TestCase):
         self.assertEqual(key, "")
 
     def test_browser_mode_rejects_curl_family_labels(self):
-        for family in ("-4", "-6", "--both"):
+        for family in ("-6", "--both"):
             with self.subTest(family=family):
                 with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
                     self.arguments("--browser", family, "--json")

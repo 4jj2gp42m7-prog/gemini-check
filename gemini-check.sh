@@ -60,7 +60,7 @@ gemini_bootstrap_python() {
 if [ "$gemini_auto" = 1 ] && [ "$gemini_help" = 0 ]; then
   for argument in "$@"; do
     case "$argument" in
-      -4|-6|--ipv4|--ipv6|--both|--install-browser|--model|--model=*|--key-file|--key-file=*)
+      -6|--ipv6|--both|--install-browser|--model|--model=*|--key-file|--key-file=*)
         printf 'Параметр %s несовместим с --auto.\n' "$argument" >&2
         exit 64
         ;;
@@ -100,17 +100,21 @@ import ipaddress
 import json
 import os
 import re
+import select
 import shutil
+import socket
+import socketserver
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
 
-VERSION = "2.2"
+VERSION = "2.3"
 BROWSER_PLAYWRIGHT_VERSION = "1.64.1"
 API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36"
@@ -555,6 +559,255 @@ def test_browser_page(page, timeout=60, nonce=None, interactive=False):
         return result
 
 
+class IPv4BrowserProxy:
+    """Ephemeral loopback CONNECT relay with strictly IPv4 remote sockets."""
+    HEADER_LIMIT = 65536
+    HEADER_TIMEOUT = 8
+    CONNECT_TIMEOUT = 10
+    IDLE_TIMEOUT = 60
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._closed = threading.Event()
+        self._active = set()
+        self._connections = []
+        self._seen = set()
+        self._failures = 0
+        self._thread = None
+        self._slots = threading.BoundedSemaphore(64)
+        owner = self
+
+        class Server(socketserver.ThreadingTCPServer):
+            address_family = socket.AF_INET
+            allow_reuse_address = True
+            daemon_threads = True
+            block_on_close = False
+            request_queue_size = 64
+
+            def handle_error(self, request, client_address):
+                # Do not log request headers, payloads or raw exception details.
+                owner._failed()
+
+        class Handler(socketserver.BaseRequestHandler):
+            def handle(self):
+                if not owner._slots.acquire(False):
+                    owner._reply(self.request, 503, "Service Unavailable")
+                    owner._failed()
+                    return
+                try:
+                    owner._serve(self.request)
+                finally:
+                    owner._slots.release()
+
+        self._server = Server(("127.0.0.1", 0), Handler)
+        self.server_url = "http://127.0.0.1:%s" % self._server.server_address[1]
+
+    def start(self):
+        if self._closed.is_set():
+            raise RuntimeError("IPv4 relay is closed")
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._server.serve_forever,
+                                            kwargs={"poll_interval": 0.1}, daemon=True)
+            self._thread.start()
+        return self
+
+    def __enter__(self):
+        return self.start()
+
+    def __exit__(self, *args):
+        self.close()
+
+    def close(self):
+        if self._closed.is_set():
+            return
+        self._closed.set()
+        if self._thread is not None:
+            self._server.shutdown()
+        self._server.server_close()
+        with self._lock:
+            sockets = list(self._active)
+        for connection in sockets:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            connection.close()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+
+    def snapshot(self):
+        with self._lock:
+            return {"family": "ipv4", "connections": [dict(x) for x in self._connections],
+                    "failures": self._failures}
+
+    def _failed(self):
+        with self._lock:
+            self._failures += 1
+
+    def _track(self, connection):
+        with self._lock:
+            if not self._closed.is_set():
+                self._active.add(connection)
+                return True
+        connection.close()
+        return False
+
+    def _release(self, connection):
+        with self._lock:
+            self._active.discard(connection)
+        connection.close()
+
+    @staticmethod
+    def _reply(client, status, reason):
+        try:
+            client.sendall(("HTTP/1.1 %s %s\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+                            % (status, reason)).encode("ascii"))
+        except OSError:
+            pass
+
+    def _headers(self, client):
+        deadline = time.monotonic() + self.HEADER_TIMEOUT
+        data = b""
+        while not self._closed.is_set():
+            marker = data.find(b"\r\n\r\n")
+            if marker >= 0:
+                if marker + 4 > self.HEADER_LIMIT:
+                    raise OverflowError()
+                return data[:marker], data[marker + 4:]
+            if len(data) > self.HEADER_LIMIT:
+                raise OverflowError()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise socket.timeout()
+            client.settimeout(remaining)
+            chunk = client.recv(8192)
+            if not chunk:
+                raise ValueError()
+            data += chunk
+        raise OSError("closed")
+
+    @staticmethod
+    def _authority(headers):
+        pieces = headers.split(b"\r\n", 1)[0].decode("ascii").split()
+        if len(pieces) != 3 or pieces[2] not in ("HTTP/1.0", "HTTP/1.1"):
+            raise ValueError()
+        if pieces[0] != "CONNECT":
+            return None
+        authority = pieces[1]
+        if authority.count(":") != 1:
+            raise ValueError()
+        host, raw_port = authority.rsplit(":", 1)
+        if (not host or len(host) > 253 or not re.fullmatch(r"[A-Za-z0-9._-]+", host)
+                or not raw_port.isdigit() or len(raw_port) > 5):
+            raise ValueError()
+        host = host.lower().rstrip(".")
+        if not host:
+            raise ValueError()
+        port = int(raw_port)
+        if not 1 <= port <= 65535:
+            raise ValueError()
+        return host.lower().rstrip("."), port
+
+    def _connect(self, host, port):
+        deadline = time.monotonic() + self.CONNECT_TIMEOUT
+        addresses = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+        for family, kind, protocol, _, address in addresses:
+            if family != socket.AF_INET or kind != socket.SOCK_STREAM or protocol not in (0, socket.IPPROTO_TCP):
+                continue
+            try:
+                parsed = ipaddress.ip_address(address[0])
+                if parsed.version != 4 or int(address[1]) != port:
+                    continue
+            except (ValueError, TypeError, IndexError):
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or self._closed.is_set():
+                break
+            remote = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            if not self._track(remote):
+                break
+            try:
+                remote.settimeout(remaining)
+                remote.connect((str(parsed), port))
+                peer = ipaddress.ip_address(remote.getpeername()[0])
+                if peer.version != 4:
+                    raise OSError("unexpected address family")
+                key = (host, str(peer), port)
+                with self._lock:
+                    if key not in self._seen and len(self._connections) < 128:
+                        self._seen.add(key)
+                        self._connections.append({"host": host, "ip": str(peer), "port": port})
+                return remote
+            except OSError:
+                self._release(remote)
+        raise OSError("no IPv4 connection")
+
+    def _tunnel(self, client, remote, pending):
+        client.settimeout(5)
+        remote.settimeout(5)
+        if pending:
+            remote.sendall(pending)
+        readers = [client, remote]
+        destinations = {client: remote, remote: client}
+        last_activity = time.monotonic()
+        while readers and not self._closed.is_set():
+            remaining = self.IDLE_TIMEOUT - (time.monotonic() - last_activity)
+            if remaining <= 0:
+                break
+            ready, _, _ = select.select(readers, [], [], min(1, remaining))
+            for source in ready:
+                chunk = source.recv(65536)
+                destination = destinations[source]
+                if chunk:
+                    destination.sendall(chunk)
+                    last_activity = time.monotonic()
+                else:
+                    readers.remove(source)
+                    try:
+                        destination.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
+
+    def _serve(self, client):
+        remote = None
+        if not self._track(client):
+            return
+        try:
+            try:
+                headers, pending = self._headers(client)
+                target = self._authority(headers)
+            except OverflowError:
+                self._failed()
+                self._reply(client, 431, "Request Header Fields Too Large")
+                return
+            except socket.timeout:
+                self._failed()
+                self._reply(client, 408, "Request Timeout")
+                return
+            except (ValueError, UnicodeError):
+                self._failed()
+                self._reply(client, 400, "Bad Request")
+                return
+            if target is None:
+                self._failed()
+                self._reply(client, 405, "Method Not Allowed")
+                return
+            try:
+                remote = self._connect(*target)
+            except (OSError, ValueError, TypeError):
+                self._failed()
+                self._reply(client, 502, "Bad Gateway")
+                return
+            client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            self._tunnel(client, remote, pending)
+        except OSError:
+            pass
+        finally:
+            if remote is not None:
+                self._release(remote)
+            self._release(client)
+
+
 def _browser_proxy(proxy):
     if not proxy:
         return None
@@ -574,7 +827,7 @@ def _browser_proxy(proxy):
     return settings
 
 
-def probe_browser(proxy="", timeout=60, headed=False, profile=None):
+def _probe_browser_session(proxy="", timeout=60, headed=False, profile=None):
     started = time.monotonic()
     deadline = started + timeout
     result = {"status": "unknown", "detail": "", "ip": "", "country": "", "colo": "", "warp": "",
@@ -599,7 +852,9 @@ def probe_browser(proxy="", timeout=60, headed=False, profile=None):
                       "args": [] if settings else ["--no-proxy-server"],
                       "timeout": min(30000, max(1000, int(timeout * 1000)))}
             if settings:
+                settings["bypass"] = "<-loopback>"
                 launch["proxy"] = settings
+                launch["args"] = ["--disable-quic", "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"]
             try:
                 if profile:
                     context = playwright.chromium.launch_persistent_context(str(profile), locale="en-US", accept_downloads=False, **launch)
@@ -670,6 +925,40 @@ def probe_browser(proxy="", timeout=60, headed=False, profile=None):
         return result
     finally:
         result["elapsed"] = round(time.monotonic() - started, 2)
+
+
+def probe_browser(proxy="", timeout=60, headed=False, profile=None, ipv4=None):
+    force_ipv4 = not proxy if ipv4 is None else ipv4
+    if not force_ipv4:
+        result = _probe_browser_session(proxy=proxy, timeout=timeout, headed=headed, profile=profile)
+        result["transport"] = {"family": "proxy" if proxy else "auto", "connections": [],
+                               "failures": 0, "google_ipv4_confirmed": False}
+        return result
+    if proxy:
+        return {"status": "proxy_unsupported", "detail": "IPv4 назначения внешнего прокси не контролируется; проверьте IPv4 сервера без --proxy",
+                "ip": "", "submitted": False, "response_verified": False,
+                "transport": {"family": "proxy", "connections": [], "failures": 0,
+                              "google_ipv4_confirmed": False}}
+    try:
+        with IPv4BrowserProxy() as relay:
+            result = _probe_browser_session(proxy=relay.server_url, timeout=timeout, headed=headed, profile=profile)
+            transport = relay.snapshot()
+            google = [c for c in transport["connections"] if c["host"] in
+                      ("gemini.google.com", "geminiweb-pa.clients6.google.com")]
+            transport["google_ipv4_confirmed"] = bool(google) and all(
+                valid_ip(c["ip"]) and ipaddress.ip_address(c["ip"]).version == 4 for c in google)
+            result["transport"] = transport
+            external = valid_ip(result.get("ip"))
+            if external and ipaddress.ip_address(external).version != 4:
+                result.update(status="family_mismatch", detail="TCP-соединения ограничены IPv4, но Cloudflare видит IPv6; проверьте трансляцию и маршрут выхода")
+            elif result["status"] in ("working", "region_blocked", "access_denied") and not transport["google_ipv4_confirmed"]:
+                result.update(status="routing_unconfirmed", detail="не подтверждено IPv4-соединение браузера с Google; вывод о доступности этого IPv4 не сделан")
+            return result
+    except OSError:
+        return {"status": "network_error", "detail": "не удалось создать локальный IPv4-канал; переключения на IPv6 не было",
+                "ip": "", "submitted": False, "response_verified": False,
+                "transport": {"family": "ipv4", "connections": [], "failures": 1,
+                              "google_ipv4_confirmed": False}}
 
 
 def api_error(response, client):
@@ -857,7 +1146,7 @@ def check_browser_route(args):
         (path / ".gemini-check-profile").touch(mode=0o600, exist_ok=True)
         profile = str(path)
     browser = probe_browser(proxy=args.proxy, timeout=args.browser_timeout,
-                            headed=args.headed, profile=profile)
+                            headed=args.headed, profile=profile, ipv4=not bool(args.proxy))
     status = browser["status"]
     if status == "working" and browser.get("response_verified") and browser.get("submitted"):
         assessment = {"status": "web_confirmed", "detail": "GEMINI WEB РАБОТАЕТ: получен новый ответ на тестовое сообщение через браузер"}
@@ -880,7 +1169,10 @@ def check_browser_route(args):
               "assessment": assessment, "warnings": []}
     if not result["ip"]:
         result["warnings"].append("внешний IP в браузере не определён; результат относится к маршруту, а не к подтверждённому адресу")
-    result["warnings"].append("Браузер выбирает IPv4/IPv6 сам; запросы curl не используются для определения его выхода")
+    if args.proxy:
+        result["warnings"].append("Семейство выхода выбирает внешний прокси; IPv4 назначения для него не гарантирован")
+    elif browser.get("transport", {}).get("google_ipv4_confirmed"):
+        result["warnings"].append("Соединение браузера с Google подтверждено через IPv4; IPv6 на сервере не изменялся")
     return result
 
 
@@ -1059,7 +1351,9 @@ BROWSER_LABELS = {"working": "ОТВЕЧАЕТ", "region_blocked": "ОТКАЗ �
                   "consent": "ТРЕБУЕТСЯ СОГЛАСИЕ", "quota": "ЛИМИТ ЗАПРОСОВ", "timeout": "ТАЙМАУТ",
                   "network_error": "ОШИБКА СЕТИ", "dependency_missing": "НУЖНА УСТАНОВКА БРАУЗЕРА",
                   "launch_error": "БРАУЗЕР НЕ ЗАПУСТИЛСЯ", "proxy_unsupported": "ПРОКСИ НЕ ПОДДЕРЖИВАЕТСЯ",
-                  "access_denied": "ДОСТУП ОТКЛОНЁН", "unknown": "НЕ ОПРЕДЕЛЕНО"}
+                  "access_denied": "ДОСТУП ОТКЛОНЁН", "unknown": "НЕ ОПРЕДЕЛЕНО",
+                  "family_mismatch": "СЕМЕЙСТВО ВЫХОДА НЕ ПОДТВЕРЖДЕНО",
+                  "routing_unconfirmed": "IPv4-МАРШРУТ НЕ ПОДТВЕРЖДЁН"}
 
 
 def print_report(report):
@@ -1069,7 +1363,8 @@ def print_report(report):
     for item in report["results"]:
         if item["id"] == "browser":
             b = item["browser"]
-            print("\nChromium | внешний IP в браузере: %s" % (item["ip"] or "не определён"))
+            mode = "IPv4 принудительно" if b.get("transport", {}).get("family") == "ipv4" else "внешний прокси"
+            print("\nChromium | %s | внешний IP: %s" % (mode, item["ip"] or "не определён"))
             print("  Cloudflare:   страна %s | узел %s | WARP %s" % (b.get("country") or "?", b.get("colo") or "?", b.get("warp") or "?"))
             print("  Gemini WEB:   %s: %s" % (BROWSER_LABELS.get(b["status"], b["status"]), b["detail"]))
             print("  Сообщение:    %s | новый ответ проверен: %s" % ("отправлено" if b.get("submitted") else "не отправлено", "да" if b.get("response_verified") else "нет"))
@@ -1148,8 +1443,8 @@ def arguments():
         parser.error("--browser-timeout должен быть от 15 до 300")
     if args.install_browser and (args.browser or args.family or args.headed or args.browser_profile or args.json or args.save or args.compare or args.proxy or args.proxy_address):
         parser.error("--install-browser запускается отдельно от проверки")
-    if args.browser and args.family:
-        parser.error("браузер выбирает семейство сам; не совмещайте --browser с -4/-6/--both")
+    if args.browser and args.family not in (None, "ipv4"):
+        parser.error("прямой браузерный тест работает через IPv4; --ipv6 и --both доступны только для curl")
     if not args.browser and (args.headed or args.browser_profile):
         parser.error("--headed и --browser-profile требуют --browser")
     if args.browser and (args.key_file or args.model):
@@ -1243,7 +1538,8 @@ def main():
             return 2
     if args.browser:
         if not args.json:
-            print("Проверяю обычный Gemini через Chromium. Лимит: %s с.\n" % args.browser_timeout, flush=True)
+            mode = "через внешний прокси" if args.proxy else "через IPv4"
+            print("Проверяю обычный Gemini через Chromium %s. Лимит: %s с.\n" % (mode, args.browser_timeout), flush=True)
         try:
             results = [check_browser_route(args)]
         except OSError:

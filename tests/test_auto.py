@@ -61,7 +61,7 @@ class AutoArgumentsTests(unittest.TestCase):
         self.assertEqual(key, "")
 
     def test_auto_rejects_incompatible_or_api_options(self):
-        for options in (("-4",), ("-6",), ("--both",), ("--install-browser",),
+        for options in (("-6",), ("--both",), ("--install-browser",),
                         ("--model", "gemini-flash-lite-latest"),
                         ("--key-file", "/tmp/should-never-be-read.key")):
             with self.subTest(options=options):
@@ -519,7 +519,7 @@ class AutoShellTests(unittest.TestCase):
         self.assertFalse(list(self.directory.glob("gemini-check.*")))
 
     def test_invalid_auto_options_fail_before_any_installation(self):
-        for options in (("-4",), ("--model", "gemini-flash-lite-latest"),
+        for options in (("-6",), ("--model", "gemini-flash-lite-latest"),
                         ("--key-file", str(self.directory / "do-not-read.key"))):
             with self.subTest(options=options):
                 result = self.invoke("--auto", *options)
