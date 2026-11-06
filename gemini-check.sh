@@ -114,7 +114,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
 
-VERSION = "2.3"
+VERSION = "2.4"
 BROWSER_PLAYWRIGHT_VERSION = "1.64.1"
 API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36"
@@ -420,16 +420,55 @@ def _browser_manual_resume(page, deadline):
     return None
 
 
+def _browser_failure(error, page):
+    """Return controlled codes, never a Playwright call log or page contents."""
+    try:
+        closed = page.is_closed()
+    except Exception:
+        closed = False
+    names = {cls.__name__ for cls in type(error).__mro__}
+    playwright_error = any(cls.__module__.startswith("playwright.") for cls in type(error).__mro__)
+    # Raw errors can contain cookies, chat text or redirect queries. Inspect them
+    # locally for known failure patterns, but export only the codes below.
+    message = str(error).casefold() if playwright_error else ""
+    if playwright_error and ("target crashed" in message or "page crashed" in message):
+        kind, reason = "page_crashed", "page_crashed"
+    elif closed or (playwright_error and any(text in message for text in (
+            "target page, context or browser has been closed", "target closed", "page has been closed"))):
+        kind, reason = "page_closed", "page_closed"
+    else:
+        kind = "timeout" if "TimeoutError" in names else "playwright_error" if playwright_error else "unexpected_error"
+        if "intercepts pointer events" in message or "another element would receive the click" in message:
+            reason = "blocked_by_overlay"
+        elif "not editable" in message or "not an <input>" in message or "not an input" in message:
+            reason = "element_not_editable"
+        elif "detached" in message or "not attached" in message:
+            reason = "element_detached"
+        elif "execution context was destroyed" in message or "navigation" in message:
+            reason = "navigation_interrupted"
+        else:
+            reason = "action_timeout" if kind == "timeout" else "dom_error" if playwright_error else "unexpected_error"
+    name = type(error).__name__
+    return {"kind": kind, "type": name if re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]{0,63}", name) else "Error",
+            "reason": reason}, closed
+
+
 def test_browser_page(page, timeout=60, nonce=None, interactive=False):
     """Test the already-open Gemini UI. No navigation, cookies or raw RPC are exported."""
     token = nonce or "CHECK_" + uuid.uuid4().hex[:20]
     result = {"status": "unknown", "detail": "", "submitted": False,
               "response_verified": False, "request_seen": False, "nonce": token,
-              "generation_http": 0}
-    deadline = time.monotonic() + max(0.1, timeout)
+              "generation_http": 0, "stage": "detect_gate"}
+    started = time.monotonic()
+    deadline = started + max(0.1, timeout)
+    state = {"sending": False, "request_seen": False, "http": 0}
+    diagnostics = {"editor_found": False, "editor_filled": False, "submit_attempted": False}
     composer, last_gate = None, ("", "")
     try:
         while time.monotonic() < deadline:
+            result["stage"] = "detect_gate"
+            if page.is_closed():
+                raise RuntimeError("closed page")
             last_gate = _browser_gate(page)
             if last_gate[0]:
                 if interactive and last_gate[0] in ("login_required", "consent"):
@@ -440,8 +479,10 @@ def test_browser_page(page, timeout=60, nonce=None, interactive=False):
             if urlsplit(page.url).hostname != "gemini.google.com":
                 result.update(status="unknown", detail="открыт другой сайт; тестовое сообщение не отправлено")
                 return result
+            result["stage"] = "locate_editor"
             composer = _browser_composer(page)
             if composer is not None:
+                diagnostics["editor_found"] = True
                 break
             page.wait_for_timeout(250)
         if composer is None:
@@ -457,13 +498,12 @@ def test_browser_page(page, timeout=60, nonce=None, interactive=False):
                 result["detail"] = "не найден доступный редактор сообщения; интерфейс мог измениться или не загрузиться"
             return result
 
+        result["stage"] = "snapshot_answers"
         before = _browser_assistants(page)
         if token in page.content() or any(token in text for text in before.values()):
             result["detail"] = "контрольный маркер уже был на странице до отправки; свежий ответ не подтверждён"
             return result
         prompt = "Reply with exactly %s. Do not add any other text." % token
-        state = {"sending": False, "request_seen": False, "http": 0}
-
         def is_probe_request(request):
             if not state["sending"] or request.method != "POST":
                 return False
@@ -492,7 +532,10 @@ def test_browser_page(page, timeout=60, nonce=None, interactive=False):
         page.on("request", sent)
         page.on("response", received)
         try:
-            composer.fill(prompt, timeout=min(5000, max(100, int((deadline - time.monotonic()) * 1000))))
+            result["stage"] = "fill_editor"
+            composer.fill(prompt, timeout=max(100, int((deadline - time.monotonic()) * 1000)))
+            diagnostics["editor_filled"] = True
+            result["stage"] = "submit"
             state["sending"] = True
             button = None
             for selector in ("button[data-test-id='send-button']", "button[aria-label='Send message']",
@@ -505,12 +548,16 @@ def test_browser_page(page, timeout=60, nonce=None, interactive=False):
                         break
                 if button is not None:
                     break
-            remaining = min(5000, max(100, int((deadline - time.monotonic()) * 1000)))
+            # Playwright also waits for overlays/animations to stop intercepting
+            # clicks. Use the user's remaining budget, not a separate 5 s cap.
+            remaining = max(100, int((deadline - time.monotonic()) * 1000))
+            diagnostics["submit_attempted"] = True
             if button is not None:
                 button.click(timeout=remaining)
             else:
                 composer.press("Enter", timeout=remaining)
             result["submitted"] = True
+            result["stage"] = "wait_answer"
             while time.monotonic() < deadline:
                 result["request_seen"], result["generation_http"] = state["request_seen"], state["http"]
                 gate = _browser_gate(page)
@@ -544,6 +591,7 @@ def test_browser_page(page, timeout=60, nonce=None, interactive=False):
                     if (state["request_seen"] and token in text and prompt not in text
                             and before.get(identity) != text):
                         result.update(status="working", response_verified=True,
+                                      stage="complete",
                                       detail="после отправки сообщения получен новый ответ модели с контрольным маркером; Gemini WEB работает сейчас")
                         return result
                 page.wait_for_timeout(250)
@@ -551,12 +599,33 @@ def test_browser_page(page, timeout=60, nonce=None, interactive=False):
                           if state["request_seen"] else "отправка сообщения на сервер Google не подтверждена; возможен сбой интерфейса"))
             return result
         finally:
-            page.remove_listener("request", sent)
-            page.remove_listener("response", received)
-    except Exception:
-        # A selector or automation failure is not an IP ban. Do not print raw errors.
-        result.update(status="unknown", detail="браузерная проверка не завершена: интерфейс изменился, страница закрыта или действие не выполнено")
+            # A click can dispatch POST and still raise afterwards. Preserve the
+            # observed request even when no action result or reply was obtained.
+            result["request_seen"], result["generation_http"] = state["request_seen"], state["http"]
+            if state["request_seen"]:
+                result["submitted"] = True
+            for event, listener in (("request", sent), ("response", received)):
+                try:
+                    page.remove_listener(event, listener)
+                except Exception:
+                    pass
+    except Exception as error:
+        result["error"], closed = _browser_failure(error, page)
+        diagnostics["page_closed"] = closed
+        kind = result["error"]["kind"]
+        diagnostics["page_crashed"] = kind == "page_crashed"
+        if kind == "page_crashed":
+            result.update(status="browser_crashed", detail="Chromium сообщил о падении страницы; причина падения не установлена")
+        elif kind == "page_closed":
+            result.update(status="browser_closed", detail="страница или браузер закрылись до завершения проверки; причина закрытия не установлена")
+        elif kind == "timeout":
+            result.update(status="timeout", detail="браузерное действие не завершилось за оставшееся время проверки")
+        else:
+            result.update(status="unknown", detail="ошибка работы с интерфейсом Gemini; этап и код указаны ниже")
         return result
+    finally:
+        result["diagnostics"] = diagnostics
+        result["elapsed_ms"] = max(0, int((time.monotonic() - started) * 1000))
 
 
 class IPv4BrowserProxy:
@@ -1352,8 +1421,20 @@ BROWSER_LABELS = {"working": "ОТВЕЧАЕТ", "region_blocked": "ОТКАЗ �
                   "network_error": "ОШИБКА СЕТИ", "dependency_missing": "НУЖНА УСТАНОВКА БРАУЗЕРА",
                   "launch_error": "БРАУЗЕР НЕ ЗАПУСТИЛСЯ", "proxy_unsupported": "ПРОКСИ НЕ ПОДДЕРЖИВАЕТСЯ",
                   "access_denied": "ДОСТУП ОТКЛОНЁН", "unknown": "НЕ ОПРЕДЕЛЕНО",
+                  "browser_closed": "СТРАНИЦА / БРАУЗЕР ЗАКРЫЛИСЬ",
+                  "browser_crashed": "СТРАНИЦА CHROMIUM УПАЛА",
                   "family_mismatch": "СЕМЕЙСТВО ВЫХОДА НЕ ПОДТВЕРЖДЕНО",
                   "routing_unconfirmed": "IPv4-МАРШРУТ НЕ ПОДТВЕРЖДЁН"}
+
+BROWSER_STAGES = {"detect_gate": "проверка входа, региона и CAPTCHA", "locate_editor": "поиск редактора",
+                  "snapshot_answers": "проверка предыдущих ответов", "fill_editor": "ввод сообщения",
+                  "submit": "отправка сообщения", "wait_answer": "ожидание нового ответа", "complete": "завершено"}
+BROWSER_ERRORS = {"blocked_by_overlay": "элемент страницы перекрывает кнопку",
+                  "element_not_editable": "редактор недоступен для ввода", "element_detached": "элемент исчез из страницы",
+                  "navigation_interrupted": "страница сменилась во время действия", "action_timeout": "истёк лимит действия",
+                  "page_closed": "страница или браузер закрылись", "page_crashed": "Chromium сообщил о падении страницы",
+                  "dom_error": "ошибка взаимодействия с интерфейсом",
+                  "unexpected_error": "непредвиденная ошибка проверки"}
 
 
 def print_report(report):
@@ -1368,6 +1449,12 @@ def print_report(report):
             print("  Cloudflare:   страна %s | узел %s | WARP %s" % (b.get("country") or "?", b.get("colo") or "?", b.get("warp") or "?"))
             print("  Gemini WEB:   %s: %s" % (BROWSER_LABELS.get(b["status"], b["status"]), b["detail"]))
             print("  Сообщение:    %s | новый ответ проверен: %s" % ("отправлено" if b.get("submitted") else "не отправлено", "да" if b.get("response_verified") else "нет"))
+            if b.get("stage") and not b.get("response_verified"):
+                print("  Этап:         %s | прошло %.1f с" % (BROWSER_STAGES.get(b["stage"], "неизвестен"), b.get("elapsed_ms", 0) / 1000))
+                print("  Запрос Google: %s | HTTP %s" % ("замечен" if b.get("request_seen") else "не замечен", b.get("generation_http") or "не получен"))
+            if b.get("error"):
+                error = b["error"]
+                print("  Причина:      %s [%s; %s]" % (BROWSER_ERRORS.get(error["reason"], "ошибка проверки"), error["reason"], error["type"]))
             print("  ОЦЕНКА:       %s" % item["assessment"]["detail"])
             for warning in item["warnings"]:
                 print("  Примечание:   " + warning)
