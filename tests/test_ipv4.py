@@ -360,7 +360,8 @@ class IPv4BrowserWrapperTests(unittest.TestCase):
         self.assertEqual(result["status"], "working", result)
         self.assertTrue(result["transport"]["google_ipv4_confirmed"])
         self.assertEqual(result["transport"]["family"], "ipv4")
-        self.assertEqual(calls, [{"proxy": relay.server_url, "timeout": 7, "headed": False, "profile": None}])
+        self.assertEqual(calls, [{"proxy": relay.server_url, "timeout": 7, "headed": False, "profile": None,
+                                 "dialog_info": False}])
         self.assertEqual(events.count("enter"), 1)
         self.assertEqual(events.count("exit"), 1)
 

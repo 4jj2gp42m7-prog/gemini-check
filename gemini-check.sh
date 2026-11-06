@@ -96,6 +96,7 @@ import argparse
 import concurrent.futures
 import datetime
 import getpass
+import hashlib
 import ipaddress
 import json
 import os
@@ -114,7 +115,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
 
-VERSION = "2.5"
+VERSION = "2.6"
 BROWSER_PLAYWRIGHT_VERSION = "1.64.1"
 API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36"
@@ -345,6 +346,127 @@ def _browser_endpoint(url):
     return "https://" + (parsed.hostname or "unknown")
 
 
+BROWSER_MODAL_SELECTOR = 'dialog[open], [role="dialog"], [role="alertdialog"], [aria-modal="true"]'
+
+
+def _browser_button_label(node):
+    return node.evaluate("""el => (el.getAttribute('aria-label') ||
+        (el.getAttribute('aria-labelledby') || '').split(/\\s+/).map(id => document.getElementById(id)?.innerText || '').join(' ').trim() ||
+        el.innerText || el.value || '').trim().slice(0, 160)""")
+
+
+def _browser_dialogs(page):
+    """Inspect only visible modal containers; raw labels remain internal by default."""
+    dialogs = []
+    for node in page.locator(BROWSER_MODAL_SELECTOR).element_handles()[:12]:
+        if not node.is_visible() or node.evaluate("el => !!el.parentElement?.closest('" + BROWSER_MODAL_SELECTOR + "')"):
+            continue
+        text = " ".join(node.inner_text().casefold().replace("’", "'").split())[:6000]
+        kind = "unknown"
+        if ("cookies" in text or "файлы cookie" in text) and any(value in text for value in (
+                "before you continue to google", "google uses cookies", "we use cookies", "прежде чем перейти к google")):
+            kind = "cookies"
+        elif any(value in text for value in ("sign in to chat", "sign in to use gemini", "sign in to continue",
+                                            "sign in to gemini", "to continue this chat", "войдите в аккаунт")):
+            kind = "login"
+        elif any(value in text for value in ("start trial", "free trial", "payment", "billing", "credit card", "purchase", "оформить подписку", "оплатить")):
+            kind = "payment"
+        elif any(value in text for value in ("terms of service", "terms of use", "i agree", "условия использования")):
+            kind = "terms"
+        elif "gemini" in text and any(value in text for value in ("privacy", "welcome", "get started", "конфиденциальност", "добро пожаловать")):
+            kind = "welcome"
+        buttons = []
+        for button in node.query_selector_all('button, [role="button"], input[type="button"], input[type="submit"]')[:24]:
+            if not button.is_visible():
+                continue
+            label = _browser_button_label(button)
+            code = {"close": "close", "закрыть": "close", "dismiss": "close",
+                    "reject all": "reject_all", "отклонить все": "reject_all",
+                    "accept all": "accept", "accept": "accept", "i agree": "accept", "agree": "accept",
+                    "принять": "accept", "принять все": "accept", "согласен": "accept",
+                    "continue": "continue", "продолжить": "continue", "got it": "continue", "понятно": "continue",
+                    "use gemini": "continue", "try gemini": "continue"}.get(label.casefold(), "unknown")
+            buttons.append({"node": button, "label": label, "code": code})
+        heading = node.evaluate("""el => (el.querySelector('h1,h2,h3,[role="heading"]')?.innerText ||
+            el.getAttribute('aria-label') || (el.getAttribute('aria-labelledby') || '').split(/\\s+/)
+            .map(id => document.getElementById(id)?.innerText || '').join(' ')).trim().slice(0,160)""")
+        dialogs.append({"node": node, "kind": kind, "heading": heading, "text": text, "buttons": buttons})
+    return dialogs
+
+
+def _browser_dialog_label(value):
+    # Explicit fresh-profile diagnostics still omit addresses and linked tokens.
+    value = re.sub(r"https?://\S+", "[URL]", value, flags=re.I)
+    value = re.sub(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", "[email]", value, flags=re.I)
+    return clean(value, limit=160)
+
+
+def _browser_handle_dialogs(page, deadline, result, diagnostics, dialog_info=False):
+    """Handle Gemini setup notices and neutral dismissals within this test session."""
+    if (time.monotonic() >= deadline
+            or urlsplit(page.url).hostname not in ("gemini.google.com", "consent.google.com")):
+        return False
+    dialogs = _browser_dialogs(page)
+    if not dialogs:
+        return False
+    dialog = dialogs[0]
+    diagnostics["dialog_kind"] = dialog["kind"]
+    diagnostics["dialog_button_codes"] = [button["code"] for button in dialog["buttons"]]
+    if dialog_info:
+        result["dialogs"] = [{"kind": item["kind"], "heading": _browser_dialog_label(item["heading"]),
+                              "buttons": [_browser_dialog_label(button["label"]) for button in item["buttons"]]}
+                             for item in dialogs[:4]]
+    if diagnostics.get("dialog_action_attempts", 0) >= 3:
+        diagnostics["dialog_action"] = "limit_reached"
+        return False
+    close = [button for button in dialog["buttons"] if button["code"] == "close"]
+    reject = [button for button in dialog["buttons"] if button["code"] == "reject_all"]
+    accept = [button for button in dialog["buttons"] if button["code"] == "accept"]
+    proceed = [button for button in dialog["buttons"] if button["code"] == "continue"]
+    choices = close
+    if dialog["kind"] == "cookies" and len(reject) == 1:
+        choices = reject
+    elif len(close) != 1 and dialog["kind"] in ("cookies", "terms", "welcome"):
+        choices = accept if len(accept) == 1 else proceed
+    if len(choices) != 1:
+        return False
+    button = choices[0]
+    signature = hashlib.sha256((dialog["kind"] + "\0" + dialog["heading"] + "\0" + dialog["text"]
+                                + "\0" + button["code"] + "\0" + button["label"]).encode("utf-8")).hexdigest()
+    if dialog["node"].get_attribute("data-gemini-check-dialog-action") == signature:
+        return False
+    # Re-read the current dialog and accessible name before the single action.
+    fresh = _browser_dialogs(page)
+    if (not fresh or fresh[0]["heading"] != dialog["heading"] or fresh[0]["kind"] != dialog["kind"]
+            or not button["node"].is_visible() or not button["node"].is_enabled()
+            or _browser_button_label(button["node"]) != button["label"]):
+        return False
+    diagnostics["dialog_action"] = button["code"]
+    diagnostics["dialog_action_attempts"] = diagnostics.get("dialog_action_attempts", 0) + 1
+    clicked = False
+    try:
+        dialog["node"].evaluate("(el, value) => el.setAttribute('data-gemini-check-dialog-action', value)", signature)
+        button["node"].click(timeout=max(1, min(1500, int((deadline - time.monotonic()) * 1000))))
+        clicked = True
+        dialog["node"].wait_for_element_state("hidden", timeout=max(1, min(1000, int((deadline - time.monotonic()) * 1000))))
+    except Exception as error:
+        failure, _ = _browser_failure(error, page)
+        if failure["reason"] == "navigation_interrupted" or failure["kind"] in ("page_closed", "page_crashed"):
+            raise
+        if clicked and failure["kind"] == "timeout":
+            # A setup wizard can advance within the same modal element. Inspect
+            # its existing handle, without a locator query waiting on navigation.
+            changed = dialog["node"].evaluate("""(el, previous) =>
+                el.innerText.toLowerCase().replace(/’/g, "'").split(/\\s+/).join(' ').trim().slice(0,6000) !== previous""", dialog["text"])
+            if changed:
+                diagnostics["dialog_steps_advanced"] = diagnostics.get("dialog_steps_advanced", 0) + 1
+                return True
+        diagnostics["dialog_action"] = "not_closed"
+        return False
+    diagnostics["dialogs_closed"] = diagnostics.get("dialogs_closed", 0) + 1
+    return True
+
+
 def _browser_gate(page):
     parsed = urlsplit(page.url)
     host = parsed.hostname or ""
@@ -367,12 +489,13 @@ def _browser_gate(page):
         return "login_required", "для продолжения нужен вход в Google; анонимный тест не завершён"
     if host == "consent.google.com":
         return "consent", "нужно решить вопрос согласия Google; работа чата не проверена"
-    for dialog in page.get_by_role("dialog").all():
-        if dialog.is_visible():
-            text = " ".join(dialog.inner_text(timeout=1000).casefold().split())
-            if (any(x in text for x in ("sign in to chat", "sign in to use gemini", "sign in to continue", "sign in to gemini"))
-                    or ("to continue this chat" in text and "sign in" in text)):
-                return "login_required", "для продолжения сайт запросил вход в Google в диалоговом окне"
+    dialogs = _browser_dialogs(page)
+    if dialogs:
+        if dialogs[0]["kind"] == "login":
+            return "login_required", "для продолжения сайт запросил вход в Google в диалоговом окне"
+        if dialogs[0]["kind"] in ("cookies", "terms", "welcome"):
+            return "consent", "открыто окно cookies или условий Google; работа чата не проверена"
+        return "dialog_required", "чат перекрыт диалоговым окном; доступная кнопка закрытия не найдена или окно не закрылось"
     if any(text in visible for text in ("you've reached your limit", "you have reached your limit",
                                        "you've reached the limit", "daily limit reached", "too many requests")):
         return "quota", "сайт сообщил о лимите запросов; это не доказательство региональной блокировки IP"
@@ -482,7 +605,7 @@ def _browser_keyboard_ready(composer, prompt):
     }""", prompt)
 
 
-def test_browser_page(page, timeout=60, nonce=None, interactive=False):
+def test_browser_page(page, timeout=60, nonce=None, interactive=False, dialog_info=False):
     """Test the already-open Gemini UI. No navigation, cookies or raw RPC are exported."""
     token = nonce or "CHECK_" + uuid.uuid4().hex[:20]
     result = {"status": "unknown", "detail": "", "submitted": False,
@@ -498,9 +621,11 @@ def test_browser_page(page, timeout=60, nonce=None, interactive=False):
             result["stage"] = "detect_gate"
             if page.is_closed():
                 raise RuntimeError("closed page")
+            if _browser_handle_dialogs(page, deadline, result, diagnostics, dialog_info):
+                continue
             last_gate = _browser_gate(page)
             if last_gate[0]:
-                if interactive and last_gate[0] in ("login_required", "consent"):
+                if interactive and last_gate[0] in ("login_required", "consent", "dialog_required"):
                     page.wait_for_timeout(250)
                     continue
                 result.update(status=last_gate[0], detail=last_gate[1])
@@ -589,6 +714,19 @@ def test_browser_page(page, timeout=60, nonce=None, interactive=False):
             # inspect the outcome instead of risking a second message.
             method, last_blocked = "", None
             while time.monotonic() < deadline:
+                if _browser_handle_dialogs(page, deadline, result, diagnostics, dialog_info):
+                    # A dismissed first-use window may have recreated the editor.
+                    # This is still before the single submit action.
+                    composer = _browser_composer(page)
+                    if composer is None:
+                        result.update(status="unknown", detail="после закрытия окна редактор ещё недоступен; сообщение не отправлено")
+                        return result
+                    composer.fill(prompt, timeout=max(1, int((deadline - time.monotonic()) * 1000)))
+                    continue
+                gate = _browser_gate(page)
+                if gate[0]:
+                    result.update(status=gate[0], detail=gate[1])
+                    return result
                 if button is not None:
                     try:
                         button.click(trial=True, timeout=max(1, min(750, int((deadline - time.monotonic()) * 1000))))
@@ -646,9 +784,11 @@ def test_browser_page(page, timeout=60, nonce=None, interactive=False):
             result["stage"] = "wait_answer"
             while time.monotonic() < deadline:
                 result["request_seen"], result["generation_http"] = state["request_seen"], state["http"]
+                if _browser_handle_dialogs(page, deadline, result, diagnostics, dialog_info):
+                    continue
                 gate = _browser_gate(page)
                 if gate[0]:
-                    if interactive and gate[0] in ("login_required", "consent"):
+                    if interactive and gate[0] in ("login_required", "consent", "dialog_required"):
                         resumed = _browser_manual_resume(page, deadline)
                         if resumed is not None:
                             return resumed
@@ -988,7 +1128,7 @@ def _browser_proxy(proxy):
     return settings
 
 
-def _probe_browser_session(proxy="", timeout=60, headed=False, profile=None):
+def _probe_browser_session(proxy="", timeout=60, headed=False, profile=None, dialog_info=False):
     started = time.monotonic()
     deadline = started + timeout
     result = {"status": "unknown", "detail": "", "ip": "", "country": "", "colo": "", "warp": "",
@@ -1054,7 +1194,8 @@ def _probe_browser_session(proxy="", timeout=60, headed=False, profile=None):
                         pass
                     if headed and profile:
                         print("Окно Gemini открыто. Если требуется, войдите вручную; проверка продолжится до истечения таймаута.", file=sys.stderr)
-                    outcome = test_browser_page(page, timeout=max(0.1, deadline - time.monotonic()), interactive=bool(headed and profile))
+                    outcome = test_browser_page(page, timeout=max(0.1, deadline - time.monotonic()),
+                                                interactive=bool(headed and profile), dialog_info=bool(dialog_info and not profile))
                     result.update(outcome)
                     result["endpoint"] = _browser_endpoint(page.url)
                     if result["status"] == "unknown" and result["http"] == 403:
@@ -1088,10 +1229,10 @@ def _probe_browser_session(proxy="", timeout=60, headed=False, profile=None):
         result["elapsed"] = round(time.monotonic() - started, 2)
 
 
-def probe_browser(proxy="", timeout=60, headed=False, profile=None, ipv4=None):
+def probe_browser(proxy="", timeout=60, headed=False, profile=None, ipv4=None, dialog_info=False):
     force_ipv4 = not proxy if ipv4 is None else ipv4
     if not force_ipv4:
-        result = _probe_browser_session(proxy=proxy, timeout=timeout, headed=headed, profile=profile)
+        result = _probe_browser_session(proxy=proxy, timeout=timeout, headed=headed, profile=profile, dialog_info=dialog_info)
         result["transport"] = {"family": "proxy" if proxy else "auto", "connections": [],
                                "failures": 0, "google_ipv4_confirmed": False}
         return result
@@ -1102,7 +1243,7 @@ def probe_browser(proxy="", timeout=60, headed=False, profile=None, ipv4=None):
                               "google_ipv4_confirmed": False}}
     try:
         with IPv4BrowserProxy() as relay:
-            result = _probe_browser_session(proxy=relay.server_url, timeout=timeout, headed=headed, profile=profile)
+            result = _probe_browser_session(proxy=relay.server_url, timeout=timeout, headed=headed, profile=profile, dialog_info=dialog_info)
             transport = relay.snapshot()
             google = [c for c in transport["connections"] if c["host"] in
                       ("gemini.google.com", "geminiweb-pa.clients6.google.com")]
@@ -1307,7 +1448,8 @@ def check_browser_route(args):
         (path / ".gemini-check-profile").touch(mode=0o600, exist_ok=True)
         profile = str(path)
     browser = probe_browser(proxy=args.proxy, timeout=args.browser_timeout,
-                            headed=args.headed, profile=profile, ipv4=not bool(args.proxy))
+                            headed=args.headed, profile=profile, ipv4=not bool(args.proxy),
+                            dialog_info=getattr(args, "browser_dialog_info", False))
     status = browser["status"]
     if status == "working" and browser.get("response_verified") and browser.get("submitted"):
         assessment = {"status": "web_confirmed", "detail": "GEMINI WEB РАБОТАЕТ: получен новый ответ на тестовое сообщение через браузер"}
@@ -1515,6 +1657,7 @@ BROWSER_LABELS = {"working": "ОТВЕЧАЕТ", "region_blocked": "ОТКАЗ �
                   "access_denied": "ДОСТУП ОТКЛОНЁН", "unknown": "НЕ ОПРЕДЕЛЕНО",
                   "browser_closed": "СТРАНИЦА / БРАУЗЕР ЗАКРЫЛИСЬ",
                   "browser_crashed": "СТРАНИЦА CHROMIUM УПАЛА",
+                  "dialog_required": "ДИАЛОГОВОЕ ОКНО МЕШАЕТ ЧАТУ",
                   "family_mismatch": "СЕМЕЙСТВО ВЫХОДА НЕ ПОДТВЕРЖДЕНО",
                   "routing_unconfirmed": "IPv4-МАРШРУТ НЕ ПОДТВЕРЖДЁН"}
 
@@ -1550,6 +1693,13 @@ def print_report(report):
                 print("  Способ:       %s" % ("клавиша Enter из редактора" if diagnostics["submit_method"] == "enter" else "клик по кнопке"))
             elif diagnostics.get("keyboard_fallback_blocked"):
                 print("  Enter:        недоступен: %s" % BROWSER_KEYBOARD.get(diagnostics["keyboard_fallback_blocked"], "редактор недоступен"))
+            if diagnostics.get("dialogs_closed"):
+                print("  Окна:         закрыто %s" % diagnostics["dialogs_closed"])
+            for dialog in b.get("dialogs", []):
+                print("  Заголовок окна: %s" % (dialog.get("heading") or "не указан"))
+                print("  Кнопки окна:  %s" % (" | ".join(dialog.get("buttons", [])) or "не найдены"))
+            if b["status"] in ("dialog_required", "consent") and not b.get("dialogs"):
+                print("  Окно:         для заголовка и кнопок добавьте --browser-dialog-info (чистый профиль)")
             if b.get("stage") and not b.get("response_verified"):
                 print("  Этап:         %s | прошло %.1f с" % (BROWSER_STAGES.get(b["stage"], "неизвестен"), b.get("elapsed_ms", 0) / 1000))
                 print("  Запрос Google: %s | HTTP %s" % ("замечен" if b.get("request_seen") else "не замечен", b.get("generation_http") or "не получен"))
@@ -1615,6 +1765,7 @@ def arguments():
     parser.add_argument("--browser-timeout", type=int, default=60, help="лимит браузерной проверки, 15..300 секунд (60)")
     parser.add_argument("--headed", action="store_true", help="показать окно Chromium (нужен --browser и графический экран)")
     parser.add_argument("--browser-profile", metavar="DIR", help="отдельный профиль для ручного Google-входа; нужен --browser")
+    parser.add_argument("--browser-dialog-info", action="store_true", help="показать заголовок и кнопки диалога в чистом браузере; нужен --browser")
     parser.add_argument("--key-file", help="прочитать ключ API из локального файла")
     parser.add_argument("--model", default="", help="модель для generateContent вместо автоматического выбора")
     parser.add_argument("--timeout", type=int, default=12, help="лимит секунд на HTTP-запрос, от 5 до 60 (12)")
@@ -1629,12 +1780,14 @@ def arguments():
         parser.error("--timeout должен быть от 5 до 60")
     if not 15 <= args.browser_timeout <= 300:
         parser.error("--browser-timeout должен быть от 15 до 300")
-    if args.install_browser and (args.browser or args.family or args.headed or args.browser_profile or args.json or args.save or args.compare or args.proxy or args.proxy_address):
+    if args.install_browser and (args.browser or args.family or args.headed or args.browser_profile or args.browser_dialog_info or args.json or args.save or args.compare or args.proxy or args.proxy_address):
         parser.error("--install-browser запускается отдельно от проверки")
     if args.browser and args.family not in (None, "ipv4"):
         parser.error("прямой браузерный тест работает через IPv4; --ipv6 и --both доступны только для curl")
-    if not args.browser and (args.headed or args.browser_profile):
-        parser.error("--headed и --browser-profile требуют --browser")
+    if not args.browser and (args.headed or args.browser_profile or args.browser_dialog_info):
+        parser.error("--headed, --browser-profile и --browser-dialog-info требуют --browser")
+    if args.browser_dialog_info and args.browser_profile:
+        parser.error("--browser-dialog-info доступен только в чистом профиле, без --browser-profile")
     if args.browser and (args.key_file or args.model):
         parser.error("--browser работает без API: --key-file и --model здесь не используются")
     if args.browser_profile:
