@@ -1,26 +1,97 @@
 #!/usr/bin/env bash
-# One-file Gemini diagnostics. Browser mode adds optional Playwright + Chromium.
+# One-file Gemini diagnostics. --auto installs prerequisites and tests the web chat.
 set -eu
-for dependency in curl python3; do
+gemini_python="python3"
+gemini_browser_home="${GEMINI_BROWSER_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/gemini-check}"
+gemini_auto=0
+gemini_browser=0
+gemini_help=0
+for argument in "$@"; do
+  case "$argument" in
+    --auto) gemini_auto=1; gemini_browser=1 ;;
+    --help|-h|--version) gemini_help=1 ;;
+    --browser|--install-browser)
+      gemini_browser=1
+      ;;
+  esac
+done
+
+gemini_python_works() {
+  command -v "$1" >/dev/null 2>&1 && "$1" -c "import sys;sys.exit(sys.version_info < (3, $2))" >/dev/null 2>&1
+}
+
+gemini_find_python() {
+  local candidate
+  for candidate in "${GEMINI_BROWSER_PYTHON:-}" "$gemini_browser_home/browser-venv/bin/python" /usr/bin/python3 python3 python3.14 python3.13 python3.12 python3.11 python3.10; do
+    if [ -n "$candidate" ] && gemini_python_works "$candidate" "$1"; then
+      gemini_python="$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+gemini_bootstrap_python() {
+  local system_id system_version
+  local privilege=(env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l)
+  if [ "$(uname -s)" != Linux ] || [ ! -r /etc/os-release ]; then
+    printf 'Для автоматической подготовки нужны Debian 12/13 или Ubuntu 22.04/24.04/26.04. На этой системе установите Python 3.10+ вручную.\n' >&2
+    return 2
+  fi
+  system_id=$(sed -n 's/^ID=//p' /etc/os-release | tr -d '\042')
+  system_version=$(sed -n 's/^VERSION_ID=//p' /etc/os-release | tr -d '\042')
+  case "$system_id:$system_version" in
+    debian:12|debian:13|ubuntu:22.04|ubuntu:24.04|ubuntu:26.04) ;;
+    *) printf 'Автоподготовка поддерживает Debian 12/13 и Ubuntu 22.04/24.04/26.04.\n' >&2; return 2 ;;
+  esac
+  if [ "$(id -u)" != 0 ]; then
+    if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+      privilege=(sudo -n env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l)
+    else
+      printf 'Для установки зависимостей запустите --auto от root или настройте доступный sudo.\n' >&2
+      return 2
+    fi
+  fi
+  printf 'Устанавливаю Python и базовые зависимости...\n' >&2
+  "${privilege[@]}" apt-get -o DPkg::Lock::Timeout=120 update >&2 || return 2
+  "${privilege[@]}" apt-get -o DPkg::Lock::Timeout=120 install -y --no-install-recommends curl python3 python3-venv ca-certificates >&2 || return 2
+}
+
+if [ "$gemini_auto" = 1 ] && [ "$gemini_help" = 0 ]; then
+  for argument in "$@"; do
+    case "$argument" in
+      -4|-6|--ipv4|--ipv6|--both|--install-browser|--model|--model=*|--key-file|--key-file=*)
+        printf 'Параметр %s несовместим с --auto.\n' "$argument" >&2
+        exit 64
+        ;;
+    esac
+  done
+  if ! gemini_find_python 10 || ! command -v curl >/dev/null 2>&1; then
+    gemini_bootstrap_python
+    if ! gemini_find_python 10; then
+      printf 'Не найден Python 3.10+. Задайте GEMINI_BROWSER_PYTHON с путём к подходящему Python.\n' >&2
+      exit 2
+    fi
+  fi
+elif [ "$gemini_browser" = 1 ]; then
+  if ! gemini_find_python 8; then
+    printf 'Не найден Python. Для установки и проверки одной командой используйте --auto.\n' >&2
+    exit 2
+  fi
+fi
+for dependency in curl "$gemini_python"; do
   if ! command -v "$dependency" >/dev/null 2>&1; then
     printf 'Нужен %s. Debian/Ubuntu: apt install curl python3\n' "$dependency" >&2
     exit 2
   fi
 done
-gemini_python="python3"
-gemini_browser_home="${GEMINI_BROWSER_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/gemini-check}"
-for argument in "$@"; do
-  case "$argument" in
-    --browser|--install-browser)
-      if [ -n "${GEMINI_BROWSER_PYTHON:-}" ]; then
-        gemini_python="$GEMINI_BROWSER_PYTHON"
-      elif [ -x "$gemini_browser_home/browser-venv/bin/python" ]; then
-        gemini_python="$gemini_browser_home/browser-venv/bin/python"
-      fi
-      ;;
-  esac
-done
-exec "$gemini_python" - "$@" <<'PYTHON_GEMINI_CHECK'
+
+# Keep this exact payload for the transition into the newly installed venv.
+gemini_saved_umask=$(umask)
+umask 077
+gemini_payload_dir=$(mktemp -d "${TMPDIR:-/tmp}/gemini-check.XXXXXXXX")
+trap 'rm -rf -- "$gemini_payload_dir"' EXIT
+cat > "$gemini_payload_dir/payload.py" <<'PYTHON_GEMINI_CHECK'
 import argparse
 import concurrent.futures
 import datetime
@@ -39,7 +110,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
 
-VERSION = "2.1"
+VERSION = "2.2"
 BROWSER_PLAYWRIGHT_VERSION = "1.64.1"
 API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36"
@@ -820,40 +891,160 @@ def browser_home():
     return Path(os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")) / "gemini-check"
 
 
-def install_browser():
+def _setup_environment():
+    return {k: v for k, v in os.environ.items() if k not in ("GEMINI_KEY", "GEMINI_PROXY")}
+
+
+def _python_supports(executable, venv_support=False, expected_prefix=None):
+    if not executable:
+        return False
+    code = "import sys;sys.exit(sys.version_info < (3,10))"
+    if venv_support:
+        code = "import venv,ensurepip;" + code
+    arguments = []
+    if expected_prefix is not None:
+        code = ("import sys;from pathlib import Path;"
+                "sys.exit(sys.version_info < (3,10) or sys.prefix == sys.base_prefix "
+                "or Path(sys.prefix).resolve() != Path(sys.argv[1]).resolve())")
+        arguments = [str(expected_prefix)]
+    try:
+        return subprocess.run([str(executable), "-c", code] + arguments, env=_setup_environment(),
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              timeout=15).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _find_browser_python(venv_support=False):
+    candidates = [os.environ.get("GEMINI_BROWSER_PYTHON"), getattr(sys, "_base_executable", None),
+                  sys.executable, "/usr/bin/python3", shutil.which("python3")]
+    candidates += [shutil.which("python3.%s" % v) for v in range(14, 9, -1)]
+    return next((p for p in candidates if p and _python_supports(p, venv_support)), None)
+
+
+def _auto_linux_privilege():
+    try:
+        release = {}
+        for line in Path("/etc/os-release").read_text().splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                release[key] = value.strip().strip("\"'")
+        supported = (release.get("ID"), release.get("VERSION_ID")) in (
+            ("debian", "12"), ("debian", "13"), ("ubuntu", "22.04"),
+            ("ubuntu", "24.04"), ("ubuntu", "26.04"))
+        if not supported or not shutil.which("apt-get"):
+            raise RuntimeError("Автоподготовка поддерживает Debian 12/13 и Ubuntu 22.04/24.04/26.04.")
+        if os.geteuid() == 0:
+            return []
+        if shutil.which("sudo") and subprocess.run(
+                ["sudo", "-n", "true"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+            return ["sudo", "-n"]
+    except OSError:
+        pass
+    raise RuntimeError("Для установки системных зависимостей запустите --auto от root или с доступным sudo.")
+
+
+def auto_browser_ready():
+    executable = browser_home() / "browser-venv" / "bin" / "python"
+    if not executable.is_file():
+        return False
+    smoke = """import sys
+from pathlib import Path
+from importlib.metadata import version
+if (sys.version_info < (3,10) or sys.prefix == sys.base_prefix
+        or Path(sys.prefix).resolve() != Path(sys.argv[1]).resolve()
+        or version('playwright') != sys.argv[2]):
+    sys.exit(1)
+from playwright.sync_api import sync_playwright
+with sync_playwright() as p:
+    browser = p.chromium.launch(headless=True, args=['--no-proxy-server'])
+    browser.close()
+"""
+    environment = {k: v for k, v in _setup_environment().items() if k not in PROXY_ENV}
+    try:
+        return subprocess.run([str(executable), "-c", smoke, str(executable.parent.parent), BROWSER_PLAYWRIGHT_VERSION],
+                              env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              timeout=35).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def install_browser(with_system_deps=False, output=None):
+    output = output if output is not None else sys.stdout
     destination = browser_home() / "browser-venv"
     executable = destination / "bin" / "python"
-    print("Установка Playwright %s и Chromium в %s" % (BROWSER_PLAYWRIGHT_VERSION, destination), flush=True)
-    setup_env = {k: v for k, v in os.environ.items() if k not in ("GEMINI_KEY", "GEMINI_PROXY")}
+    setup_env = _setup_environment()
+    privilege = []
+    print("Подготовка Playwright %s и Chromium в %s" % (BROWSER_PLAYWRIGHT_VERSION, destination), file=output, flush=True)
     try:
-        if not executable.is_file():
-            candidates = [os.environ.get("GEMINI_BROWSER_PYTHON", ""), sys.executable]
-            candidates += [shutil.which("python3.%s" % v) for v in range(14, 9, -1)]
-            selected = None
-            for candidate in candidates:
-                if candidate and subprocess.run([candidate, "-c", "import sys;sys.exit(sys.version_info < (3,10))"],
-                                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=setup_env).returncode == 0:
-                    selected = candidate
-                    break
+        if with_system_deps and sys.platform.startswith("linux"):
+            privilege = _auto_linux_privilege()
+            setup_env.update(DEBIAN_FRONTEND="noninteractive", NEEDRESTART_MODE="l")
+            if not _find_browser_python(venv_support=True) or not Path("/etc/ssl/certs/ca-certificates.crt").is_file():
+                package_env = dict(setup_env, DEBIAN_FRONTEND="noninteractive")
+                for operation in (["update"], ["install", "-y", "--no-install-recommends",
+                                               "curl", "python3", "python3-venv", "ca-certificates"]):
+                    subprocess.run(privilege + ["env", "DEBIAN_FRONTEND=noninteractive", "NEEDRESTART_MODE=l", "apt-get",
+                                                "-o", "DPkg::Lock::Timeout=120"] + operation,
+                                   env=package_env, stdout=output, check=True)
+        if not _python_supports(executable, expected_prefix=destination):
+            selected = _find_browser_python(venv_support=True)
             if not selected:
-                print("Для браузера нужен Python 3.10+. Укажите его через GEMINI_BROWSER_PYTHON=/путь/к/python3.", file=sys.stderr)
-                return 2
+                raise RuntimeError("Нужен Python 3.10+ с модулем venv. Debian/Ubuntu: apt install python3-venv.")
+            selected = str(Path(selected).resolve())
             destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            subprocess.run([selected, "-m", "venv", str(destination)], check=True, env=setup_env)
-        subprocess.run([str(executable), "-c", "import sys;sys.exit(sys.version_info < (3,10))"], check=True, env=setup_env)
-        subprocess.run([str(executable), "-m", "ensurepip", "--upgrade"], check=True, env=setup_env)
+            if destination.exists() or destination.is_symlink():
+                if os.path.commonpath((selected, str(destination.resolve()))) == str(destination.resolve()):
+                    raise RuntimeError("Для восстановления окружения нужен Python 3.10+ вне папки browser-venv.")
+                backup = destination.with_name("browser-venv.previous-" + uuid.uuid4().hex[:8])
+                destination.rename(backup)
+                print("Предыдущее несовместимое окружение сохранено: %s" % backup, file=output)
+            subprocess.run([selected, "-m", "venv", str(destination)], env=setup_env, stdout=output, check=True)
+        if not _python_supports(executable, expected_prefix=destination):
+            raise RuntimeError("Не удалось создать изолированное окружение Python. Установка пакетов не выполнялась.")
+        subprocess.run([str(executable), "-m", "ensurepip", "--upgrade"], env=setup_env, stdout=output, check=True)
         subprocess.run([str(executable), "-m", "pip", "install", "--disable-pip-version-check",
-                        "playwright==" + BROWSER_PLAYWRIGHT_VERSION], check=True, env=setup_env)
-        subprocess.run([str(executable), "-m", "playwright", "install", "chromium"], check=True, env=setup_env)
-    except (OSError, subprocess.CalledProcessError):
-        print("Установка не завершена. Нужны Python 3.10+, модуль venv и доступ к PyPI/CDN Playwright.", file=sys.stderr)
-        print("Debian/Ubuntu: apt install python3-venv", file=sys.stderr)
+                        "playwright==" + BROWSER_PLAYWRIGHT_VERSION], env=setup_env, stdout=output, check=True)
+        if with_system_deps and sys.platform.startswith("linux"):
+            subprocess.run(privilege + ["env", "DEBIAN_FRONTEND=noninteractive", "NEEDRESTART_MODE=l",
+                                       str(executable), "-m", "playwright", "install-deps", "chromium"],
+                           env=setup_env, stdout=output, check=True)
+        subprocess.run([str(executable), "-m", "playwright", "install", "chromium"],
+                       env=setup_env, stdout=output, check=True)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
         return 2
-    print("Готово. Запуск: gemini-check --browser")
-    if sys.platform.startswith("linux"):
-        print("Если Chromium сообщит о недостающих системных библиотеках, выполните с нужными правами:")
-        print("  %s -m playwright install-deps chromium" % config_quote(str(executable)))
+    except (OSError, subprocess.CalledProcessError):
+        print("Установка не завершена. Проверьте доступ к пакетным репозиториям и PyPI/CDN Playwright.", file=sys.stderr)
+        return 2
+    print("Браузерное окружение подготовлено.", file=output, flush=True)
+    if sys.platform.startswith("linux") and not with_system_deps:
+        print("Для автоматической установки системных библиотек и проверки используйте --auto.", file=output)
     return 0
+
+
+def prepare_auto_browser(args):
+    if auto_browser_ready():
+        return 0
+    if install_browser(with_system_deps=sys.platform.startswith("linux"), output=sys.stderr) != 0:
+        return 2
+    if not auto_browser_ready():
+        print("Chromium после установки не запустился. Проверка Gemini не выполнялась; это не блокировка IP.", file=sys.stderr)
+        return 2
+    return 0
+
+
+def reexec_auto_browser():
+    destination = browser_home() / "browser-venv"
+    if Path(sys.prefix).resolve() == destination.resolve() and sys.prefix != sys.base_prefix:
+        return
+    if os.environ.get("GEMINI_AUTO_REEXEC") == "1":
+        raise OSError("managed Python did not enter its virtual environment")
+    executable = destination / "bin" / "python"
+    # Keep the requested VPN proxy, but never carry an API key into browser mode.
+    environment = {k: v for k, v in os.environ.items() if k != "GEMINI_KEY"}
+    environment["GEMINI_AUTO_REEXEC"] = "1"
+    os.execve(str(executable), [str(executable), __file__] + sys.argv[1:], environment)
 
 
 API_LABELS = {"working": "РАБОТАЕТ", "not_checked": "НЕ ПРОВЕРЕНО", "region_blocked": "ОТКАЗ ПО РЕГИОНУ",
@@ -936,6 +1127,7 @@ def arguments():
     family.add_argument("--both", action="store_const", const="both", dest="family", help="IPv4 и IPv6 отдельно (по умолчанию)")
     parser.add_argument("--no-api", action="store_true", help="без ключа и без обращения к API")
     parser.add_argument("--browser", action="store_true", help="настоящий тест веб-чата в Chromium без API-ключа")
+    parser.add_argument("--auto", action="store_true", help="самостоятельно установить зависимости и проверить веб-чат без API-ключа")
     parser.add_argument("--install-browser", action="store_true", help="установить отдельное окружение Playwright и Chromium")
     parser.add_argument("--browser-timeout", type=int, default=60, help="лимит браузерной проверки, 15..300 секунд (60)")
     parser.add_argument("--headed", action="store_true", help="показать окно Chromium (нужен --browser и графический экран)")
@@ -948,6 +1140,8 @@ def arguments():
     parser.add_argument("--compare", metavar="FILE", help="сравнить с предыдущим JSON-снимком")
     parser.add_argument("--version", action="version", version=VERSION)
     args = parser.parse_args()
+    if args.auto:
+        args.browser = True
     if not 5 <= args.timeout <= 60:
         parser.error("--timeout должен быть от 5 до 60")
     if not 15 <= args.browser_timeout <= 300:
@@ -1039,6 +1233,14 @@ def main():
         except (OSError, UnicodeError, ValueError):
             print("Не удалось прочитать совместимый JSON-отчёт --compare.", file=sys.stderr)
             return 2
+    if args.auto:
+        if prepare_auto_browser(args) != 0:
+            return 2
+        try:
+            reexec_auto_browser()
+        except OSError:
+            print("Не удалось запустить подготовленное окружение браузера. Проверка Gemini не выполнялась.", file=sys.stderr)
+            return 2
     if args.browser:
         if not args.json:
             print("Проверяю обычный Gemini через Chromium. Лимит: %s с.\n" % args.browser_timeout, flush=True)
@@ -1087,3 +1289,5 @@ if __name__ == "__main__":
         print("\nПроверка прервана.", file=sys.stderr)
         sys.exit(130)
 PYTHON_GEMINI_CHECK
+umask "$gemini_saved_umask"
+"$gemini_python" "$gemini_payload_dir/payload.py" "$@"

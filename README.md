@@ -4,34 +4,54 @@
 
 Это помогает владельцу VPN проверить конкретный выход: европейская страна в геобазе и открывшаяся стартовая страница ещё не подтверждают работу чата. Успех подтверждает работу Gemini Web на этом маршруте в момент проверки, но не доступ всем аккаунтам и не будущую репутацию IP.
 
-## Быстрый запуск на VPS
+## Запуск одной командой на VPS
 
-Нужны **Bash, curl и Python 3.10+**. Браузер по умолчанию работает без окна, графический рабочий стол не требуется.
+На Debian 12/13 или Ubuntu 22.04/24.04/26.04 выполните от root:
 
-Установите или обновите команду:
+~~~bash
+bash <(curl -fsSL https://raw.githubusercontent.com/4jj2gp42m7-prog/gemini-check/main/gemini-check.sh) --auto
+~~~
+
+Для скачивания нужны Bash и curl. Дальше скрипт сам установит недостающий Python, модуль venv, сертификаты, отдельное окружение Playwright, Chromium и его системные библиотеки, затем проверит обычный веб-чат. Также подходит пользователь с sudo без запроса пароля. Графический рабочий стол не требуется.
+
+**API-ключ не нужен и не запрашивается.** `--auto` включает браузерную проверку и не использует Gemini Developer API, даже если в окружении задан `GEMINI_KEY`.
+
+Для выхода через прокси:
+
+~~~bash
+bash <(curl -fsSL https://raw.githubusercontent.com/4jj2gp42m7-prog/gemini-check/main/gemini-check.sh) --auto --proxy 'socks5h://127.0.0.1:40000'
+~~~
+
+При повторном запуске скрипт проверит, что готовый Chromium запускается, и переиспользует окружение без повторной установки пакетов и скачивания браузера. Разовый запуск не создаёт команду в `/usr/local/bin`.
+
+Если старое браузерное окружение использует несовместимый Python, оно сохраняется рядом в папке `browser-venv.previous-*`, а новое создаётся отдельно. Профили Google при этом не затрагиваются.
+
+Автоматическая установка системных пакетов выполняется только в явном режиме `--auto`. Скрипт не делает `apt upgrade`, не меняет DNS и маршруты и не перенастраивает службы. Установочные сообщения идут в stderr; после подготовки с `--auto --json` в stdout остаётся диагностический JSON.
+
+На macOS `--auto` может использовать уже подготовленное окружение или доступный Python 3.10+. Сам Python через Homebrew скрипт не устанавливает. Подготовка Linux с нуля ограничена указанными версиями Debian и Ubuntu.
+
+## Установка постоянной команды и ручной контроль
+
+Чтобы установить или обновить команду `gemini-check`, выполните с правами записи в `/usr/local/bin`:
 
 ~~~bash
 curl -fsSL https://raw.githubusercontent.com/4jj2gp42m7-prog/gemini-check/main/gemini-check.sh -o /usr/local/bin/gemini-check && chmod +x /usr/local/bin/gemini-check
 ~~~
 
-Для записи в `/usr/local/bin` нужны соответствующие права. Затем один раз установите браузерное окружение и запустите тест:
+После этого установка всего необходимого и проверка тоже выполняются одной командой:
+
+~~~bash
+gemini-check --auto
+~~~
+
+Если нужно управлять установкой отдельно, остаются ручные режимы:
 
 ~~~bash
 gemini-check --install-browser
 gemini-check --browser
 ~~~
 
-API-ключ не запрашивается. Режим `--browser` не обращается к Gemini Developer API, даже если в окружении задан `GEMINI_KEY`.
-
-После установки окружения возможен и разовый запуск:
-
-~~~bash
-bash <(curl -fsSL https://raw.githubusercontent.com/4jj2gp42m7-prog/gemini-check/main/gemini-check.sh) --browser
-~~~
-
-### Установка браузера
-
-`--install-browser` создаёт отдельное Python-окружение, устанавливает **Playwright 1.64.1** и скачивает Chromium. Системные Python-пакеты, DNS и маршруты не меняются. По умолчанию окружение находится здесь:
+Они требуют Python 3.10+ и не устанавливают системные пакеты автоматически. `--install-browser` создаёт отдельное Python-окружение, устанавливает **Playwright 1.64.1** и скачивает Chromium. Системные Python-пакеты не меняются. По умолчанию окружение находится здесь:
 
 ~~~text
 ~/.local/share/gemini-check/browser-venv
@@ -39,7 +59,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/4jj2gp42m7-prog/gemini-check
 
 Если задан `XDG_DATA_HOME`, используется его папка `gemini-check`. Переменная `GEMINI_BROWSER_HOME` задаёт другую папку данных. Скрипт сам выбирает установленный runtime. Кеш Chromium остаётся в штатной папке Playwright; установку и проверки запускайте от одного пользователя.
 
-Если обычный `python3` старше 3.10, установщик ищет подходящий Python. Можно указать его явно:
+Если версия обычного `python3` ниже 3.10, установщик ищет подходящий Python. Можно указать его явно:
 
 ~~~bash
 GEMINI_BROWSER_PYTHON=/usr/bin/python3.12 gemini-check --install-browser
@@ -51,7 +71,7 @@ GEMINI_BROWSER_PYTHON=/usr/bin/python3.12 gemini-check --install-browser
 apt install python3-venv
 ~~~
 
-Установщик не запускает apt или sudo. Если Chromium сообщит о недостающих системных библиотеках, выполните отдельно с нужными правами:
+Ручной режим `--install-browser` не запускает apt или sudo. Если Chromium сообщит о недостающих системных библиотеках, используйте `--auto` или выполните отдельно с нужными правами:
 
 ~~~bash
 "${GEMINI_BROWSER_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/gemini-check}/browser-venv/bin/python" -m playwright install-deps chromium
@@ -183,10 +203,11 @@ gemini-check --ipv4 --model gemini-flash-lite-latest
 
 | Параметр | Действие |
 |---|---|
-| `--browser` | Реальный тест обычного Gemini Web без API-ключа |
+| `--auto` | Установить недостающие зависимости и проверить Gemini Web без API-ключа |
+| `--browser` | Реальный тест обычного Gemini Web с уже установленным Chromium |
 | `--install-browser` | Отдельно установить Playwright и Chromium |
 | `--browser-timeout SEC` | Лимит браузерной проверки: 15..300 секунд, по умолчанию 60 |
-| `--headed` | Показать окно; нужен `--browser` и графический экран |
+| `--headed` | Показать окно; нужен `--browser` или `--auto` и графический экран |
 | `--browser-profile DIR` | Отдельный профиль для ручного Google-входа |
 | `--proxy URL` или позиционный URL | Проверить прокси; также доступна `GEMINI_PROXY` |
 | `--json` / `--save FILE` / `--compare FILE` | Вывод, сохранение и сравнение отчётов |
@@ -197,7 +218,9 @@ gemini-check --ipv4 --model gemini-flash-lite-latest
 | `--timeout SEC` | Лимит curl-запроса: 5..60 секунд, по умолчанию 12 |
 | `--help` / `--version` | Справка или версия |
 
-`--install-browser` запускается отдельно от проверок. Параметры `--key-file` и `--model` с `--browser` отклоняются.
+`--auto` допускает прокси, `--json`, `--save`, `--compare`, `--headed`, `--browser-profile` и `--browser-timeout`. Параметры семейства `--ipv4`/`--ipv6`/`--both`, `--key-file`, `--model` и `--install-browser` с ним не совмещаются.
+
+`--install-browser` запускается отдельно от проверок. Параметры `--key-file` и `--model` с `--browser` отклоняются. Ошибка подготовки окружения в `--auto` завершается кодом `2`; проверка Gemini в этом случае не запускается.
 
 ## Коды завершения
 

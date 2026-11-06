@@ -240,7 +240,7 @@ class CliTests(unittest.TestCase):
             self.fail("Expected a JSON report, exit=%s, stdout=%r, stderr=%r" % (completed.returncode, completed.stdout, completed.stderr))
         self.assertIsInstance(report, dict)
         self.assertEqual(report.get("schema_version"), 1)
-        self.assertEqual(str(report.get("version")), "2.1")
+        self.assertEqual(str(report.get("version")), "2.2")
         self.assertTrue(report.get("checked_at"))
         self.assertIsInstance(report.get("results"), list)
         self.assertIsInstance(report.get("changes"), list)
