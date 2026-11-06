@@ -9,7 +9,7 @@
 #   GEMINI_KEY=ключ gemini-check.sh                   плюс проверка через API Gemini
 #   GEMINI_KEY=- gemini-check.sh                      без API и без вопроса о ключе
 
-VERSION="1.7"
+VERSION="1.8"
 BLOCKED="RU BY CN HK MO IR KP CU SY"
 
 # Вопрос пользователю: читаем с терминала, даже если скрипт пришёл через pipe
@@ -35,6 +35,7 @@ fi
 if [ -n "$PROXY" ]; then NET=(-x "$PROXY"); WHAT="прокси ${PROXY##*@}"; else NET=(-4); WHAT="IPv4 этого сервера"; fi
 C() { curl -s --max-time 20 "${NET[@]}" "$@"; }
 jfield() { grep -o "\"$1\": *\"[^\"]*\"" | head -1 | cut -d'"' -f4; }
+tracefield() { sed -n "s/^$1=//p" | head -1 | tr -d '\r'; }
 
 echo "Проверяем: $WHAT   (gemini-check $VERSION)"
 echo
@@ -54,18 +55,36 @@ if echo "$ORG" | grep -qiE 'host|cloud|server|data ?cent|vps|ovh|hetzner|digital
   echo "                         похоже на дата-центр: Google такие IP помечает чаще"
 fi
 
-# 2. Страна, которую Google определил для IP (YouTube пишет её в код страницы)
+# 2. IP, страна, узел и WARP по Cloudflare (не определяет доступность Gemini)
+if CF_TRACE=$(C -f https://www.cloudflare.com/cdn-cgi/trace); then
+  CF_IP=$(echo "$CF_TRACE" | tracefield ip)
+  CF_LOC=$(echo "$CF_TRACE" | tracefield loc)
+  if [ -n "$CF_IP" ] && [ -n "$CF_LOC" ]; then
+    CF_COLO=$(echo "$CF_TRACE" | tracefield colo)
+    CF_WARP=$(echo "$CF_TRACE" | tracefield warp)
+    echo "  Cloudflare, IP:        $CF_IP"
+    echo "  Cloudflare, страна:    $CF_LOC"
+    echo "  Cloudflare, узел:      ${CF_COLO:-?}"
+    echo "  Cloudflare, WARP:      ${CF_WARP:-?}"
+  else
+    echo "  Cloudflare trace:      некорректный ответ"
+  fi
+else
+  echo "  Cloudflare trace:      недоступен (ошибка соединения или HTTP)"
+fi
+
+# 3. Страна, которую Google определил для IP (YouTube пишет её в код страницы)
 YT=$(C -L -b 'SOCS=CAI' -H 'Accept-Language: en-US,en;q=0.9' https://www.youtube.com/)
 GL=$(echo "$YT" | grep -o '"GL":"[A-Z]*"' | head -1 | cut -d'"' -f4)
 echo "  YouTube показывает:    ${GL:-не удалось определить}"
 
-# 3. Есть ли сетевой доступ к gemini.google.com. Страну этот пункт не проверяет:
+# 4. Есть ли сетевой доступ к gemini.google.com. Страну этот пункт не проверяет:
 #    сайт отвечает 200 и там, где Gemini недоступен
 GEM_CODE=$(C -o /dev/null -w '%{http_code}' -A 'Mozilla/5.0' https://gemini.google.com/)
 if [ "$GEM_CODE" = 200 ]; then GEM_NOTE="есть (страну не проверяет)"; else GEM_NOTE="нет (HTTP ${GEM_CODE:-000})"; fi
 echo "  Связь с gemini.google: $GEM_NOTE"
 
-# 4. Ответ самого Gemini через API (если дали ключ): лёгкие модели параллельно, не дольше 10 секунд
+# 5. Ответ самого Gemini через API (если дали ключ): лёгкие модели параллельно, не дольше 10 секунд
 API=""
 if [ -n "$GEMINI_KEY" ]; then
   BASE="https://generativelanguage.googleapis.com/v1beta"
