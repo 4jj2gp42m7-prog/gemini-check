@@ -114,7 +114,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
 
-VERSION = "2.4"
+VERSION = "2.5"
 BROWSER_PLAYWRIGHT_VERSION = "1.64.1"
 API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36"
@@ -438,7 +438,9 @@ def _browser_failure(error, page):
         kind, reason = "page_closed", "page_closed"
     else:
         kind = "timeout" if "TimeoutError" in names else "playwright_error" if playwright_error else "unexpected_error"
-        if "intercepts pointer events" in message or "another element would receive the click" in message:
+        if "click action done" in message and "waiting for scheduled navigations" in message:
+            reason = "navigation_interrupted"
+        elif "intercepts pointer events" in message or "another element would receive the click" in message:
             reason = "blocked_by_overlay"
         elif "not editable" in message or "not an <input>" in message or "not an input" in message:
             reason = "element_not_editable"
@@ -453,6 +455,33 @@ def _browser_failure(error, page):
             "reason": reason}, closed
 
 
+def _browser_keyboard_ready(composer, prompt):
+    """Use the already-focused editor only; never type behind a modal or overlay."""
+    return composer.evaluate("""(editor, prompt) => {
+        const reject = reason => ({ready: false, reason});
+        const visible = el => {
+            const style = getComputedStyle(el), r = el.getBoundingClientRect();
+            return style.visibility !== 'hidden' && style.display !== 'none' && r.width > 0 && r.height > 0;
+        };
+        if (!editor.isConnected || !visible(editor)) return reject('editor_unavailable');
+        if (!(editor === document.activeElement || editor.contains(document.activeElement))) return reject('editor_not_focused');
+        if (editor.closest('[inert], [aria-disabled="true"]') || editor.disabled || editor.readOnly) return reject('editor_unavailable');
+        if (!editor.isContentEditable && !['TEXTAREA', 'INPUT'].includes(editor.tagName)) return reject('editor_unavailable');
+        const text = 'value' in editor ? editor.value : editor.innerText;
+        if (text.trim() !== prompt) return reject('prompt_changed');
+        if ([...document.querySelectorAll('dialog[open], [role="dialog"], [role="alertdialog"], [aria-modal="true"]')].some(visible)) return reject('modal_open');
+        if (editor.getAttribute('aria-expanded') === 'true' || editor.getAttribute('aria-activedescendant') ||
+            [...document.querySelectorAll('[role="listbox"], [role="menu"]')].some(visible)) return reject('suggestions_open');
+        const r = editor.getBoundingClientRect();
+        const left = Math.max(0, r.left), right = Math.min(innerWidth, r.right);
+        const top = Math.max(0, r.top), bottom = Math.min(innerHeight, r.bottom);
+        if (left >= right || top >= bottom) return reject('editor_unavailable');
+        const hit = document.elementFromPoint((left + right) / 2, (top + bottom) / 2);
+        if (!hit || !(hit === editor || editor.contains(hit))) return reject('editor_covered');
+        return {ready: true, reason: ''};
+    }""", prompt)
+
+
 def test_browser_page(page, timeout=60, nonce=None, interactive=False):
     """Test the already-open Gemini UI. No navigation, cookies or raw RPC are exported."""
     token = nonce or "CHECK_" + uuid.uuid4().hex[:20]
@@ -461,7 +490,7 @@ def test_browser_page(page, timeout=60, nonce=None, interactive=False):
               "generation_http": 0, "stage": "detect_gate"}
     started = time.monotonic()
     deadline = started + max(0.1, timeout)
-    state = {"sending": False, "request_seen": False, "http": 0}
+    state = {"sending": False, "request_seen": False, "nonce_request_seen": False, "http": 0}
     diagnostics = {"editor_found": False, "editor_filled": False, "submit_attempted": False}
     composer, last_gate = None, ("", "")
     try:
@@ -520,14 +549,23 @@ def test_browser_page(page, timeout=60, nonce=None, interactive=False):
             except Exception:
                 return False
 
+        accepted_requests = set()
+
         def sent(request):
             if is_probe_request(request):
+                accepted_requests.add(request)
                 state["request_seen"] = True
+                if urlsplit(request.url).hostname == "gemini.google.com":
+                    state["nonce_request_seen"] = True
 
         def received(response):
-            if is_probe_request(response.request):
+            # A pre-submit background request can finish after our action starts.
+            # Correlate to the request event instead of reclassifying its response.
+            if response.request in accepted_requests:
                 state["request_seen"] = True
                 state["http"] = response.status
+                if urlsplit(response.request.url).hostname == "gemini.google.com":
+                    state["nonce_request_seen"] = True
 
         page.on("request", sent)
         page.on("response", received)
@@ -536,7 +574,6 @@ def test_browser_page(page, timeout=60, nonce=None, interactive=False):
             composer.fill(prompt, timeout=max(100, int((deadline - time.monotonic()) * 1000)))
             diagnostics["editor_filled"] = True
             result["stage"] = "submit"
-            state["sending"] = True
             button = None
             for selector in ("button[data-test-id='send-button']", "button[aria-label='Send message']",
                              "button[aria-label='Submit']", "button[aria-label='Send']"):
@@ -548,15 +585,64 @@ def test_browser_page(page, timeout=60, nonce=None, interactive=False):
                         break
                 if button is not None:
                     break
-            # Playwright also waits for overlays/animations to stop intercepting
-            # clicks. Use the user's remaining budget, not a separate 5 s cap.
-            remaining = max(100, int((deadline - time.monotonic()) * 1000))
+            # Only readiness trials may repeat. After any real submit attempt,
+            # inspect the outcome instead of risking a second message.
+            method, last_blocked = "", None
+            while time.monotonic() < deadline:
+                if button is not None:
+                    try:
+                        button.click(trial=True, timeout=max(1, min(750, int((deadline - time.monotonic()) * 1000))))
+                        method = "click"
+                        break
+                    except Exception as error:
+                        failure, _ = _browser_failure(error, page)
+                        if failure["kind"] != "timeout":
+                            raise
+                        last_blocked = error
+                keyboard = _browser_keyboard_ready(composer, prompt)
+                if keyboard["ready"]:
+                    method = "enter"
+                    break
+                diagnostics["keyboard_fallback_blocked"] = keyboard["reason"]
+                gate = _browser_gate(page)
+                if gate[0]:
+                    result.update(status=gate[0], detail=gate[1])
+                    return result
+                page.wait_for_timeout(max(1, min(100, int((deadline - time.monotonic()) * 1000))))
+            if not method:
+                if last_blocked is not None:
+                    raise last_blocked
+                result.update(status="timeout", detail="редактор недоступен для безопасной отправки; сообщение не отправлено")
+                return result
+            diagnostics["submit_method"] = method
             diagnostics["submit_attempted"] = True
-            if button is not None:
-                button.click(timeout=remaining)
-            else:
-                composer.press("Enter", timeout=remaining)
-            result["submitted"] = True
+            state["sending"] = True
+            action_error = None
+            try:
+                if method == "click":
+                    # Readiness has already been checked. Keep time to inspect
+                    # a reply if this one action fails after being dispatched.
+                    button.click(timeout=max(1, min(3000, int((deadline - time.monotonic()) * 1000))))
+                else:
+                    # The trial did not click. Keep the existing focus and use a
+                    # real keystroke rather than focusing behind an overlay.
+                    keyboard = _browser_keyboard_ready(composer, prompt)
+                    if not keyboard["ready"]:
+                        diagnostics["submit_attempted"] = False
+                        diagnostics["keyboard_fallback_blocked"] = keyboard["reason"]
+                        result.update(status="unknown", detail="фокус или доступность редактора изменились перед отправкой; сообщение не отправлено")
+                        return result
+                    page.keyboard.press("Enter")
+                result["submitted"] = True
+            except Exception as error:
+                # A dispatched click can still fail afterwards. A fresh reply
+                # remains verifiable; never retry the submit action here.
+                action_error = error
+                diagnostics["submit_action_error"] = _browser_failure(error, page)[0]
+                if diagnostics["submit_action_error"]["reason"] == "navigation_interrupted":
+                    # Locator queries may wait indefinitely for a pending main
+                    # frame navigation. Return its bounded action failure.
+                    raise
             result["stage"] = "wait_answer"
             while time.monotonic() < deadline:
                 result["request_seen"], result["generation_http"] = state["request_seen"], state["http"]
@@ -590,11 +676,14 @@ def test_browser_page(page, timeout=60, nonce=None, interactive=False):
                 for identity, text in _browser_assistants(page).items():
                     if (state["request_seen"] and token in text and prompt not in text
                             and before.get(identity) != text):
-                        result.update(status="working", response_verified=True,
+                        result.update(status="working", response_verified=True, submitted=True,
                                       stage="complete",
                                       detail="после отправки сообщения получен новый ответ модели с контрольным маркером; Gemini WEB работает сейчас")
                         return result
                 page.wait_for_timeout(250)
+            if action_error is not None:
+                result["stage"] = "submit"
+                raise action_error
             result.update(status="timeout", detail=("новый ответ модели не получен за отведённое время"
                           if state["request_seen"] else "отправка сообщения на сервер Google не подтверждена; возможен сбой интерфейса"))
             return result
@@ -602,7 +691,10 @@ def test_browser_page(page, timeout=60, nonce=None, interactive=False):
             # A click can dispatch POST and still raise afterwards. Preserve the
             # observed request even when no action result or reply was obtained.
             result["request_seen"], result["generation_http"] = state["request_seen"], state["http"]
-            if state["request_seen"]:
+            # Modern processSession also carries initialization/background work.
+            # Only a nonce-bearing request, completed UI action or fresh reply
+            # can establish that our message was submitted.
+            if state["nonce_request_seen"]:
                 result["submitted"] = True
             for event, listener in (("request", sent), ("response", received)):
                 try:
@@ -1435,6 +1527,9 @@ BROWSER_ERRORS = {"blocked_by_overlay": "элемент страницы пер�
                   "page_closed": "страница или браузер закрылись", "page_crashed": "Chromium сообщил о падении страницы",
                   "dom_error": "ошибка взаимодействия с интерфейсом",
                   "unexpected_error": "непредвиденная ошибка проверки"}
+BROWSER_KEYBOARD = {"editor_unavailable": "редактор недоступен", "editor_not_focused": "фокус ушёл из редактора",
+                    "prompt_changed": "содержимое редактора изменилось", "modal_open": "открыто диалоговое окно",
+                    "suggestions_open": "открыты подсказки или меню", "editor_covered": "редактор тоже перекрыт"}
 
 
 def print_report(report):
@@ -1448,7 +1543,13 @@ def print_report(report):
             print("\nChromium | %s | внешний IP: %s" % (mode, item["ip"] or "не определён"))
             print("  Cloudflare:   страна %s | узел %s | WARP %s" % (b.get("country") or "?", b.get("colo") or "?", b.get("warp") or "?"))
             print("  Gemini WEB:   %s: %s" % (BROWSER_LABELS.get(b["status"], b["status"]), b["detail"]))
-            print("  Сообщение:    %s | новый ответ проверен: %s" % ("отправлено" if b.get("submitted") else "не отправлено", "да" if b.get("response_verified") else "нет"))
+            diagnostics = b.get("diagnostics", {})
+            sent = "отправлено" if b.get("submitted") else "отправка не подтверждена" if diagnostics.get("submit_attempted") else "не отправлено"
+            print("  Сообщение:    %s | новый ответ проверен: %s" % (sent, "да" if b.get("response_verified") else "нет"))
+            if diagnostics.get("submit_method"):
+                print("  Способ:       %s" % ("клавиша Enter из редактора" if diagnostics["submit_method"] == "enter" else "клик по кнопке"))
+            elif diagnostics.get("keyboard_fallback_blocked"):
+                print("  Enter:        недоступен: %s" % BROWSER_KEYBOARD.get(diagnostics["keyboard_fallback_blocked"], "редактор недоступен"))
             if b.get("stage") and not b.get("response_verified"):
                 print("  Этап:         %s | прошло %.1f с" % (BROWSER_STAGES.get(b["stage"], "неизвестен"), b.get("elapsed_ms", 0) / 1000))
                 print("  Запрос Google: %s | HTTP %s" % ("замечен" if b.get("request_seen") else "не замечен", b.get("generation_http") or "не получен"))

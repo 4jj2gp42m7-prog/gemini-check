@@ -186,11 +186,13 @@ setTimeout(() => document.getElementById('loading').remove(), 5500);
         self.assert_safe(result)
 
     def test_submit_failure_preserves_generation_request_already_seen(self):
-        self.load(fixture())
+        self.load(fixture("no_answer"))
         locator_type = type(self.page.locator("button"))
         actual_click = locator_type.click
         def fail_after_click(locator, *args, **kwargs):
             actual_click(locator, *args, **kwargs)
+            if kwargs.get("trial"):
+                return
             self.page.wait_for_timeout(60)
             raise RuntimeError("private submit state " + SECRET)
         with patch.object(locator_type, "click", fail_after_click):
