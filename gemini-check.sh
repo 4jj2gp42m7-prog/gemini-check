@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-file Gemini diagnostics. Requires curl and Python 3.8+, no pip packages.
+# One-file Gemini diagnostics. Browser mode adds optional Playwright + Chromium.
 set -eu
 for dependency in curl python3; do
   if ! command -v "$dependency" >/dev/null 2>&1; then
@@ -7,7 +7,20 @@ for dependency in curl python3; do
     exit 2
   fi
 done
-exec python3 - "$@" <<'PYTHON_GEMINI_CHECK'
+gemini_python="python3"
+gemini_browser_home="${GEMINI_BROWSER_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/gemini-check}"
+for argument in "$@"; do
+  case "$argument" in
+    --browser|--install-browser)
+      if [ -n "${GEMINI_BROWSER_PYTHON:-}" ]; then
+        gemini_python="$GEMINI_BROWSER_PYTHON"
+      elif [ -x "$gemini_browser_home/browser-venv/bin/python" ]; then
+        gemini_python="$gemini_browser_home/browser-venv/bin/python"
+      fi
+      ;;
+  esac
+done
+exec "$gemini_python" - "$@" <<'PYTHON_GEMINI_CHECK'
 import argparse
 import concurrent.futures
 import datetime
@@ -16,6 +29,7 @@ import ipaddress
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -25,7 +39,8 @@ from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
 
-VERSION = "2.0"
+VERSION = "2.1"
+BROWSER_PLAYWRIGHT_VERSION = "1.64.1"
 API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36"
 PROXY_ENV = ("http_proxy", "https_proxy", "all_proxy", "no_proxy",
@@ -249,6 +264,343 @@ def probe_web(client):
     return result
 
 
+def _browser_endpoint(url):
+    """Only publish a site name; chat IDs, redirect queries and tokens stay local."""
+    parsed = urlsplit(url)
+    return "https://" + (parsed.hostname or "unknown")
+
+
+def _browser_gate(page):
+    parsed = urlsplit(page.url)
+    host = parsed.hostname or ""
+    try:
+        visible = page.locator("body").inner_text(timeout=1000)
+    except Exception:
+        visible = ""
+    visible = " ".join(visible.casefold().replace("’", "'").split())
+    match = re.search(r"gemini (?:is |isn't |is not )?(?:currently )?(?:not |isn't )?"
+                      r"(?:yet )?(?:supported|available) in your (?:country|region|location)", visible)
+    negative = match and ("not " in match.group() or "isn't " in match.group())
+    if negative or (host in ("gemini.google.com", "gemini.google")
+                    and parse_qs(parsed.query).get("location") == ["unsupported"]):
+        return "region_blocked", "сайт Gemini явно сообщил, что регион не поддерживается"
+    if (host in ("www.google.com", "google.com") and parsed.path.startswith("/sorry")) or any(
+            text in visible for text in ("our systems have detected unusual traffic", "verify you are human",
+                                         "confirm you're not a robot", "unusual traffic from your computer network")):
+        return "challenge", "Google запросил CAPTCHA или проверку; это не доказательство региональной блокировки IP"
+    if host == "accounts.google.com":
+        return "login_required", "для продолжения нужен вход в Google; анонимный тест не завершён"
+    if host == "consent.google.com":
+        return "consent", "нужно решить вопрос согласия Google; работа чата не проверена"
+    for dialog in page.get_by_role("dialog").all():
+        if dialog.is_visible():
+            text = " ".join(dialog.inner_text(timeout=1000).casefold().split())
+            if (any(x in text for x in ("sign in to chat", "sign in to use gemini", "sign in to continue", "sign in to gemini"))
+                    or ("to continue this chat" in text and "sign in" in text)):
+                return "login_required", "для продолжения сайт запросил вход в Google в диалоговом окне"
+    if any(text in visible for text in ("you've reached your limit", "you have reached your limit",
+                                       "you've reached the limit", "daily limit reached", "too many requests")):
+        return "quota", "сайт сообщил о лимите запросов; это не доказательство региональной блокировки IP"
+    return "", ""
+
+
+def _browser_composer(page):
+    selectors = ("rich-textarea [contenteditable='true'][role='textbox']",
+                 ".ql-editor[contenteditable='true']", "textarea[aria-label]",
+                 "[contenteditable='true'][role='textbox']")
+    for selector in selectors:
+        locator = page.locator(selector)
+        for index in range(min(locator.count(), 8)):
+            candidate = locator.nth(index)
+            if candidate.is_visible() and candidate.is_editable():
+                return candidate
+    return None
+
+
+def _browser_assistants(page):
+    # Explicit model-response containers exclude the user's prompt and welcome text.
+    selectors = ("model-response message-content", "model-response .model-response-text",
+                 "[data-message-author-role='model'] message-content", "model-response",
+                 ".model-response-text")
+    values = {}
+    for selector in selectors:
+        locator = page.locator(selector)
+        count = locator.count()
+        for index in range(max(0, count - 20), count):
+            candidate = locator.nth(index)
+            if candidate.is_visible():
+                values[(selector, index)] = candidate.inner_text(timeout=1000).strip()
+    return values
+
+
+def _browser_manual_resume(page, deadline):
+    print("Gemini запросил вход или согласие. Выполните действие вручную в открытом окне.", file=sys.stderr)
+    while time.monotonic() < deadline:
+        gate = _browser_gate(page)
+        if (not gate[0] and urlsplit(page.url).hostname == "gemini.google.com"
+                and _browser_composer(page) is not None):
+            # A new probe after the manual action avoids accepting an earlier reply.
+            return test_browser_page(page, timeout=max(0.1, deadline - time.monotonic()), interactive=False)
+        page.wait_for_timeout(250)
+    return None
+
+
+def test_browser_page(page, timeout=60, nonce=None, interactive=False):
+    """Test the already-open Gemini UI. No navigation, cookies or raw RPC are exported."""
+    token = nonce or "CHECK_" + uuid.uuid4().hex[:20]
+    result = {"status": "unknown", "detail": "", "submitted": False,
+              "response_verified": False, "request_seen": False, "nonce": token,
+              "generation_http": 0}
+    deadline = time.monotonic() + max(0.1, timeout)
+    composer, last_gate = None, ("", "")
+    try:
+        while time.monotonic() < deadline:
+            last_gate = _browser_gate(page)
+            if last_gate[0]:
+                if interactive and last_gate[0] in ("login_required", "consent"):
+                    page.wait_for_timeout(250)
+                    continue
+                result.update(status=last_gate[0], detail=last_gate[1])
+                return result
+            if urlsplit(page.url).hostname != "gemini.google.com":
+                result.update(status="unknown", detail="открыт другой сайт; тестовое сообщение не отправлено")
+                return result
+            composer = _browser_composer(page)
+            if composer is not None:
+                break
+            page.wait_for_timeout(250)
+        if composer is None:
+            if last_gate[0]:
+                result.update(status=last_gate[0], detail=last_gate[1])
+                return result
+            # A sign-in button alone is normal on an anonymous, usable chat.
+            # Only an explicit prompt to sign in plus no composer is a login gate.
+            body = " ".join(page.locator("body").inner_text(timeout=1000).casefold().split())
+            if any(x in body for x in ("sign in to chat", "sign in to use gemini", "sign in to continue")):
+                result.update(status="login_required", detail="сайт требует входа перед отправкой сообщения")
+            else:
+                result["detail"] = "не найден доступный редактор сообщения; интерфейс мог измениться или не загрузиться"
+            return result
+
+        before = _browser_assistants(page)
+        if token in page.content() or any(token in text for text in before.values()):
+            result["detail"] = "контрольный маркер уже был на странице до отправки; свежий ответ не подтверждён"
+            return result
+        prompt = "Reply with exactly %s. Do not add any other text." % token
+        state = {"sending": False, "request_seen": False, "http": 0}
+
+        def is_probe_request(request):
+            if not state["sending"] or request.method != "POST":
+                return False
+            endpoint = urlsplit(request.url)
+            # The current anonymous web UI serializes requests to this web backend.
+            # Its private payload format is deliberately not decoded. A fresh model
+            # reply with our unpredictable token remains mandatory for success.
+            if endpoint.hostname == "geminiweb-pa.clients6.google.com" and endpoint.path == "/v1/processSession":
+                return True
+            if endpoint.hostname != "gemini.google.com":
+                return False
+            try:
+                return token in (request.post_data or "")
+            except Exception:
+                return False
+
+        def sent(request):
+            if is_probe_request(request):
+                state["request_seen"] = True
+
+        def received(response):
+            if is_probe_request(response.request):
+                state["request_seen"] = True
+                state["http"] = response.status
+
+        page.on("request", sent)
+        page.on("response", received)
+        try:
+            composer.fill(prompt, timeout=min(5000, max(100, int((deadline - time.monotonic()) * 1000))))
+            state["sending"] = True
+            button = None
+            for selector in ("button[data-test-id='send-button']", "button[aria-label='Send message']",
+                             "button[aria-label='Submit']", "button[aria-label='Send']"):
+                candidates = page.locator(selector)
+                for index in range(min(candidates.count(), 8)):
+                    candidate = candidates.nth(index)
+                    if candidate.is_visible() and candidate.is_enabled():
+                        button = candidate
+                        break
+                if button is not None:
+                    break
+            remaining = min(5000, max(100, int((deadline - time.monotonic()) * 1000)))
+            if button is not None:
+                button.click(timeout=remaining)
+            else:
+                composer.press("Enter", timeout=remaining)
+            result["submitted"] = True
+            while time.monotonic() < deadline:
+                result["request_seen"], result["generation_http"] = state["request_seen"], state["http"]
+                gate = _browser_gate(page)
+                if gate[0]:
+                    if interactive and gate[0] in ("login_required", "consent"):
+                        resumed = _browser_manual_resume(page, deadline)
+                        if resumed is not None:
+                            return resumed
+                    result.update(status=gate[0], detail=gate[1])
+                    return result
+                if _browser_composer(page) is None:
+                    visible = " ".join(page.locator("body").inner_text(timeout=1000).casefold().split())
+                    if (any(x in visible for x in ("sign in to chat", "sign in to use gemini", "sign in to continue"))
+                            or ("to continue this chat" in visible and "sign in" in visible)):
+                        if interactive:
+                            resumed = _browser_manual_resume(page, deadline)
+                            if resumed is not None:
+                                return resumed
+                        result.update(status="login_required", detail="после отправки сайт потребовал входа в Google")
+                        return result
+                if state["http"] == 429:
+                    result.update(status="quota", detail="запрос веб-чата получил HTTP 429; работа не подтверждена")
+                    return result
+                if state["http"] == 403:
+                    result.update(status="access_denied", detail="запрос веб-чата получил HTTP 403; причина отказа по IP не установлена")
+                    return result
+                if state["http"] >= 500:
+                    result.update(status="network_error", detail="Google вернул временную ошибку HTTP %s" % state["http"])
+                    return result
+                for identity, text in _browser_assistants(page).items():
+                    if (state["request_seen"] and token in text and prompt not in text
+                            and before.get(identity) != text):
+                        result.update(status="working", response_verified=True,
+                                      detail="после отправки сообщения получен новый ответ модели с контрольным маркером; Gemini WEB работает сейчас")
+                        return result
+                page.wait_for_timeout(250)
+            result.update(status="timeout", detail=("новый ответ модели не получен за отведённое время"
+                          if state["request_seen"] else "отправка сообщения на сервер Google не подтверждена; возможен сбой интерфейса"))
+            return result
+        finally:
+            page.remove_listener("request", sent)
+            page.remove_listener("response", received)
+    except Exception:
+        # A selector or automation failure is not an IP ban. Do not print raw errors.
+        result.update(status="unknown", detail="браузерная проверка не завершена: интерфейс изменился, страница закрыта или действие не выполнено")
+        return result
+
+
+def _browser_proxy(proxy):
+    if not proxy:
+        return None
+    parsed = urlsplit(proxy)
+    scheme = parsed.scheme.lower()
+    if scheme in ("socks5", "socks5h") and (parsed.username is not None or parsed.password is not None):
+        raise ValueError("SOCKS5 с логином и паролем не поддерживается Chromium; используйте локальный SOCKS без авторизации или HTTP-прокси")
+    if scheme not in ("http", "https", "socks5", "socks5h") or not parsed.hostname or not parsed.port:
+        raise ValueError("неподдерживаемый адрес прокси браузера")
+    host = parsed.hostname
+    if ":" in host:
+        host = "[" + host + "]"
+    settings = {"server": "%s://%s:%s" % ("socks5" if scheme == "socks5h" else scheme, host, parsed.port)}
+    if parsed.username is not None:
+        settings["username"] = unquote(parsed.username)
+        settings["password"] = unquote(parsed.password or "")
+    return settings
+
+
+def probe_browser(proxy="", timeout=60, headed=False, profile=None):
+    started = time.monotonic()
+    deadline = started + timeout
+    result = {"status": "unknown", "detail": "", "ip": "", "country": "", "colo": "", "warp": "",
+              "submitted": False, "response_verified": False, "request_seen": False,
+              "http": 0, "endpoint": "https://gemini.google.com", "elapsed": 0}
+    try:
+        settings = _browser_proxy(proxy)
+    except (ValueError, TypeError):
+        result.update(status="proxy_unsupported", detail="Chromium не поддерживает такой прокси, включая SOCKS5 с авторизацией; используйте локальный SOCKS без пароля или HTTP-прокси")
+        return result
+    try:
+        from playwright.sync_api import sync_playwright, Error as BrowserError, TimeoutError as BrowserTimeout
+    except ImportError:
+        result.update(status="dependency_missing", detail="Playwright не установлен. Выполните gemini-check --install-browser")
+        return result
+    environment = {k: v for k, v in os.environ.items()
+                   if k not in PROXY_ENV + ("GEMINI_KEY", "GEMINI_PROXY")}
+    browser, context = None, None
+    try:
+        with sync_playwright() as playwright:
+            launch = {"headless": not headed, "env": environment,
+                      "args": [] if settings else ["--no-proxy-server"],
+                      "timeout": min(30000, max(1000, int(timeout * 1000)))}
+            if settings:
+                launch["proxy"] = settings
+            try:
+                if profile:
+                    context = playwright.chromium.launch_persistent_context(str(profile), locale="en-US", accept_downloads=False, **launch)
+                else:
+                    browser = playwright.chromium.launch(**launch)
+                    context = browser.new_context(locale="en-US", accept_downloads=False)
+            except BrowserError as exc:
+                text = str(exc).casefold()
+                missing = "executable doesn't exist" in text or "playwright install" in text
+                result.update(status="dependency_missing" if missing else "launch_error",
+                              detail="не найден Chromium; выполните gemini-check --install-browser" if missing else "Chromium не запустился; проверьте системные библиотеки и доступность графики для --headed")
+                return result
+            try:
+                trace = context.new_page()
+                try:
+                    response = trace.goto("https://www.cloudflare.com/cdn-cgi/trace", wait_until="domcontentloaded",
+                                          timeout=max(500, int(min(10, timeout / 4) * 1000)))
+                    if response and response.status == 200:
+                        text = trace.locator("body").inner_text(timeout=1000)
+                        fields = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+                        result.update(ip=valid_ip(fields.get("ip")), country=country(fields.get("loc")),
+                                      colo=clean(fields.get("colo")), warp=clean(fields.get("warp")))
+                except BrowserError:
+                    pass
+                finally:
+                    trace.close()
+                page = context.new_page()
+                try:
+                    response = page.goto("https://gemini.google.com/app?hl=en", wait_until="domcontentloaded",
+                                         timeout=max(500, int(min(30, max(0, deadline - time.monotonic())) * 1000)))
+                    result["http"] = response.status if response else 0
+                    result["endpoint"] = _browser_endpoint(page.url)
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=max(100, int(min(3, max(0, deadline - time.monotonic())) * 1000)))
+                    except BrowserTimeout:
+                        pass
+                    if headed and profile:
+                        print("Окно Gemini открыто. Если требуется, войдите вручную; проверка продолжится до истечения таймаута.", file=sys.stderr)
+                    outcome = test_browser_page(page, timeout=max(0.1, deadline - time.monotonic()), interactive=bool(headed and profile))
+                    result.update(outcome)
+                    result["endpoint"] = _browser_endpoint(page.url)
+                    if result["status"] == "unknown" and result["http"] == 403:
+                        result.update(status="access_denied", detail="сайт Gemini ответил HTTP 403; причина отказа не установлена")
+                    return result
+                except BrowserTimeout:
+                    result.update(status="timeout", detail="страница Gemini не загрузилась за отведённое время; это не доказательство блокировки IP")
+                    return result
+                except BrowserError as exc:
+                    text = str(exc)
+                    note = "ошибка DNS" if "ERR_NAME_NOT_RESOLVED" in text else (
+                        "ошибка TLS-сертификата" if "ERR_CERT" in text else (
+                            "не удалось подключиться к прокси" if "ERR_PROXY" in text or "ERR_SOCKS" in text else "ошибка соединения браузера"))
+                    result.update(status="network_error", detail=note)
+                    return result
+            finally:
+                if context is not None:
+                    try:
+                        context.close()
+                    except BrowserError:
+                        pass
+                if browser is not None:
+                    try:
+                        browser.close()
+                    except BrowserError:
+                        pass
+    except BrowserError:
+        result.update(status="launch_error", detail="браузерная сессия неожиданно завершилась; проверьте Chromium и системные зависимости")
+        return result
+    finally:
+        result["elapsed"] = round(time.monotonic() - started, 2)
+
+
 def api_error(response, client):
     if response["curl"]:
         return {"status": "network_error", "detail": transport_detail(response)}
@@ -425,6 +777,85 @@ def compare_reports(previous, current):
     return changes
 
 
+def check_browser_route(args):
+    profile = args.browser_profile
+    if profile:
+        path = Path(profile).expanduser().resolve()
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path.chmod(0o700)
+        (path / ".gemini-check-profile").touch(mode=0o600, exist_ok=True)
+        profile = str(path)
+    browser = probe_browser(proxy=args.proxy, timeout=args.browser_timeout,
+                            headed=args.headed, profile=profile)
+    status = browser["status"]
+    if status == "working" and browser.get("response_verified") and browser.get("submitted"):
+        assessment = {"status": "web_confirmed", "detail": "GEMINI WEB РАБОТАЕТ: получен новый ответ на тестовое сообщение через браузер"}
+    elif status in ("region_blocked", "access_denied"):
+        assessment = {"status": "restricted", "detail": "сайт Gemini отказал в доступе на этом маршруте; точная причина указана в результате браузера"}
+    else:
+        assessment = {"status": "inconclusive", "detail": "РАБОТА ЧАТА НЕ ПОДТВЕРЖДЕНА; этот результат сам по себе не означает блокировку IP"}
+    blank = {"http": 0, "curl": 0, "remote_ip": "", "elapsed": 0,
+             "status": "not_checked", "detail": "в браузерном режиме не используется"}
+    cf = dict(blank, status="ok" if browser.get("ip") else "unavailable",
+              http=200 if browser.get("ip") else 0,
+              detail="IP определён через Chromium" if browser.get("ip") else "браузер не получил IP от Cloudflare",
+              ip=browser.get("ip", ""), country=browser.get("country", ""),
+              colo=browser.get("colo", ""), warp=browser.get("warp", ""))
+    result = {"id": "browser", "ip": browser.get("ip", ""), "browser": browser,
+              "cloudflare": cf, "ipinfo": dict(blank, ip="", country="", org=""),
+              "youtube": dict(blank, country=""),
+              "web": dict(blank, status=status, http=browser.get("http", 0), region_hint="", detail=browser["detail"]),
+              "api": {"status": "not_checked", "detail": "браузерный режим работает без API", "attempts": []},
+              "assessment": assessment, "warnings": []}
+    if not result["ip"]:
+        result["warnings"].append("внешний IP в браузере не определён; результат относится к маршруту, а не к подтверждённому адресу")
+    result["warnings"].append("Браузер выбирает IPv4/IPv6 сам; запросы curl не используются для определения его выхода")
+    return result
+
+
+def browser_home():
+    configured = os.environ.get("GEMINI_BROWSER_HOME")
+    if configured:
+        return Path(configured).expanduser()
+    return Path(os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")) / "gemini-check"
+
+
+def install_browser():
+    destination = browser_home() / "browser-venv"
+    executable = destination / "bin" / "python"
+    print("Установка Playwright %s и Chromium в %s" % (BROWSER_PLAYWRIGHT_VERSION, destination), flush=True)
+    setup_env = {k: v for k, v in os.environ.items() if k not in ("GEMINI_KEY", "GEMINI_PROXY")}
+    try:
+        if not executable.is_file():
+            candidates = [os.environ.get("GEMINI_BROWSER_PYTHON", ""), sys.executable]
+            candidates += [shutil.which("python3.%s" % v) for v in range(14, 9, -1)]
+            selected = None
+            for candidate in candidates:
+                if candidate and subprocess.run([candidate, "-c", "import sys;sys.exit(sys.version_info < (3,10))"],
+                                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=setup_env).returncode == 0:
+                    selected = candidate
+                    break
+            if not selected:
+                print("Для браузера нужен Python 3.10+. Укажите его через GEMINI_BROWSER_PYTHON=/путь/к/python3.", file=sys.stderr)
+                return 2
+            destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            subprocess.run([selected, "-m", "venv", str(destination)], check=True, env=setup_env)
+        subprocess.run([str(executable), "-c", "import sys;sys.exit(sys.version_info < (3,10))"], check=True, env=setup_env)
+        subprocess.run([str(executable), "-m", "ensurepip", "--upgrade"], check=True, env=setup_env)
+        subprocess.run([str(executable), "-m", "pip", "install", "--disable-pip-version-check",
+                        "playwright==" + BROWSER_PLAYWRIGHT_VERSION], check=True, env=setup_env)
+        subprocess.run([str(executable), "-m", "playwright", "install", "chromium"], check=True, env=setup_env)
+    except (OSError, subprocess.CalledProcessError):
+        print("Установка не завершена. Нужны Python 3.10+, модуль venv и доступ к PyPI/CDN Playwright.", file=sys.stderr)
+        print("Debian/Ubuntu: apt install python3-venv", file=sys.stderr)
+        return 2
+    print("Готово. Запуск: gemini-check --browser")
+    if sys.platform.startswith("linux"):
+        print("Если Chromium сообщит о недостающих системных библиотеках, выполните с нужными правами:")
+        print("  %s -m playwright install-deps chromium" % config_quote(str(executable)))
+    return 0
+
+
 API_LABELS = {"working": "РАБОТАЕТ", "not_checked": "НЕ ПРОВЕРЕНО", "region_blocked": "ОТКАЗ ПО РЕГИОНУ",
               "key_error": "ПРОБЛЕМА КЛЮЧА", "billing": "БИЛЛИНГ / ДОСТУП К FREE TIER",
               "permission_denied": "НЕТ ПРАВ КЛЮЧА ИЛИ ПРОЕКТА", "quota": "КВОТА / ЛИМИТ ЗАПРОСОВ",
@@ -432,11 +863,29 @@ API_LABELS = {"working": "РАБОТАЕТ", "not_checked": "НЕ ПРОВЕРЕ
               "invalid_response": "ГЕНЕРАЦИЯ НЕ ПОДТВЕРЖДЕНА", "no_model": "НЕТ ПОДХОДЯЩЕЙ МОДЕЛИ",
               "model_missing": "МОДЕЛЬ НЕДОСТУПНА", "api_error": "ОШИБКА API"}
 
+BROWSER_LABELS = {"working": "ОТВЕЧАЕТ", "region_blocked": "ОТКАЗ ПО РЕГИОНУ",
+                  "login_required": "ТРЕБУЕТСЯ ВХОД", "challenge": "ПРОВЕРКА GOOGLE / CAPTCHA",
+                  "consent": "ТРЕБУЕТСЯ СОГЛАСИЕ", "quota": "ЛИМИТ ЗАПРОСОВ", "timeout": "ТАЙМАУТ",
+                  "network_error": "ОШИБКА СЕТИ", "dependency_missing": "НУЖНА УСТАНОВКА БРАУЗЕРА",
+                  "launch_error": "БРАУЗЕР НЕ ЗАПУСТИЛСЯ", "proxy_unsupported": "ПРОКСИ НЕ ПОДДЕРЖИВАЕТСЯ",
+                  "access_denied": "ДОСТУП ОТКЛОНЁН", "unknown": "НЕ ОПРЕДЕЛЕНО"}
+
 
 def print_report(report):
     print("gemini-check %s | %s" % (VERSION, report["checked_at"]))
-    print("Проверка IP и маршрута. WEB и API оцениваются отдельно.")
+    browser_mode = any(item["id"] == "browser" for item in report["results"])
+    print("Проверка обычного веб-чата через Chromium, без API." if browser_mode else "Проверка IP и маршрута. WEB и API оцениваются отдельно.")
     for item in report["results"]:
+        if item["id"] == "browser":
+            b = item["browser"]
+            print("\nChromium | внешний IP в браузере: %s" % (item["ip"] or "не определён"))
+            print("  Cloudflare:   страна %s | узел %s | WARP %s" % (b.get("country") or "?", b.get("colo") or "?", b.get("warp") or "?"))
+            print("  Gemini WEB:   %s: %s" % (BROWSER_LABELS.get(b["status"], b["status"]), b["detail"]))
+            print("  Сообщение:    %s | новый ответ проверен: %s" % ("отправлено" if b.get("submitted") else "не отправлено", "да" if b.get("response_verified") else "нет"))
+            print("  ОЦЕНКА:       %s" % item["assessment"]["detail"])
+            for warning in item["warnings"]:
+                print("  Примечание:   " + warning)
+            continue
         print("\n%s | выходной IP: %s" % ({"ipv4": "IPv4 сервера", "ipv6": "IPv6 сервера", "proxy": "Прокси"}[item["id"]], item["ip"] or "не определён"))
         cf, info, yt = item["cloudflare"], item["ipinfo"], item["youtube"]
         print("  ipinfo:       %s | %s | %s" % (info["ip"] or "?", info["country"] or "?", info["org"] or info["detail"]))
@@ -465,7 +914,10 @@ def print_report(report):
     if len(report["results"]) > 1 and len({r["assessment"]["status"] for r in report["results"]}) > 1:
         print("\nIPv4 и IPv6 дали разные результаты. Проверьте, какой маршрут используют клиенты VPN.")
     print("\nПроверяйте тот же выход и маршрутизацию доменов Google, что используют клиенты VPN.")
-    print("Закрытую репутацию IP и будущую доступность узнать нельзя. Для WEB нужен тест сообщения в аккаунте.")
+    if browser_mode:
+        print("Успех подтверждает работу чата сейчас для проверенного браузера. Для других аккаунтов условия могут отличаться.")
+    else:
+        print("Закрытую репутацию IP и будущую доступность узнать нельзя. Для WEB нужна отправка сообщения через браузер.")
 
 
 class Arguments(argparse.ArgumentParser):
@@ -483,6 +935,11 @@ def arguments():
     family.add_argument("-6", "--ipv6", action="store_const", const="ipv6", dest="family", help="только IPv6 сервера")
     family.add_argument("--both", action="store_const", const="both", dest="family", help="IPv4 и IPv6 отдельно (по умолчанию)")
     parser.add_argument("--no-api", action="store_true", help="без ключа и без обращения к API")
+    parser.add_argument("--browser", action="store_true", help="настоящий тест веб-чата в Chromium без API-ключа")
+    parser.add_argument("--install-browser", action="store_true", help="установить отдельное окружение Playwright и Chromium")
+    parser.add_argument("--browser-timeout", type=int, default=60, help="лимит браузерной проверки, 15..300 секунд (60)")
+    parser.add_argument("--headed", action="store_true", help="показать окно Chromium (нужен --browser и графический экран)")
+    parser.add_argument("--browser-profile", metavar="DIR", help="отдельный профиль для ручного Google-входа; нужен --browser")
     parser.add_argument("--key-file", help="прочитать ключ API из локального файла")
     parser.add_argument("--model", default="", help="модель для generateContent вместо автоматического выбора")
     parser.add_argument("--timeout", type=int, default=12, help="лимит секунд на HTTP-запрос, от 5 до 60 (12)")
@@ -493,9 +950,28 @@ def arguments():
     args = parser.parse_args()
     if not 5 <= args.timeout <= 60:
         parser.error("--timeout должен быть от 5 до 60")
+    if not 15 <= args.browser_timeout <= 300:
+        parser.error("--browser-timeout должен быть от 15 до 300")
+    if args.install_browser and (args.browser or args.family or args.headed or args.browser_profile or args.json or args.save or args.compare or args.proxy or args.proxy_address):
+        parser.error("--install-browser запускается отдельно от проверки")
+    if args.browser and args.family:
+        parser.error("браузер выбирает семейство сам; не совмещайте --browser с -4/-6/--both")
+    if not args.browser and (args.headed or args.browser_profile):
+        parser.error("--headed и --browser-profile требуют --browser")
+    if args.browser and (args.key_file or args.model):
+        parser.error("--browser работает без API: --key-file и --model здесь не используются")
+    if args.browser_profile:
+        path = Path(args.browser_profile).expanduser()
+        try:
+            if path.exists() and (not path.is_dir() or (any(path.iterdir()) and not (path / ".gemini-check-profile").is_file())):
+                parser.error("--browser-profile должен указывать на пустую папку или профиль, созданный gemini-check")
+        except OSError:
+            parser.error("не удалось проверить папку --browser-profile")
     if args.proxy and args.proxy_address:
         parser.error("укажите прокси только одним способом")
     args.proxy = args.proxy or args.proxy_address or os.environ.get("GEMINI_PROXY", "")
+    if args.install_browser:
+        return args, ""
     if args.proxy:
         try:
             parsed = urlsplit(args.proxy)
@@ -512,6 +988,8 @@ def arguments():
         args.model = args.model[7:] if args.model.startswith("models/") else args.model
         if not re.fullmatch(r"gemini-[A-Za-z0-9._-]+", args.model):
             parser.error("--model должен быть идентификатором gemini-...")
+    if args.browser:
+        return args, ""
     key = os.environ.get("GEMINI_KEY", "")
     skip = args.no_api or (key == "-" and not args.key_file)
     if args.key_file and not skip:
@@ -550,6 +1028,8 @@ def main():
         print("Нужен Python 3.8 или новее.", file=sys.stderr)
         return 2
     args, key = arguments()
+    if args.install_browser:
+        return install_browser()
     previous = None
     if args.compare:
         try:
@@ -559,13 +1039,22 @@ def main():
         except (OSError, UnicodeError, ValueError):
             print("Не удалось прочитать совместимый JSON-отчёт --compare.", file=sys.stderr)
             return 2
-    routes = ["proxy"] if args.proxy else ([args.family] if args.family in ("ipv4", "ipv6") else ["ipv4", "ipv6"])
-    if not args.json:
-        print("Проверяю %s. Лимит на запрос: %s с.\n" % (", ".join(routes), args.timeout), flush=True)
-    with tempfile.TemporaryDirectory(prefix="gemini-check-") as directory:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(routes)) as pool:
-            pending = [pool.submit(check_route, directory, route, args.proxy, key, args.timeout, args.model) for route in routes]
-            results = [future.result() for future in pending]
+    if args.browser:
+        if not args.json:
+            print("Проверяю обычный Gemini через Chromium. Лимит: %s с.\n" % args.browser_timeout, flush=True)
+        try:
+            results = [check_browser_route(args)]
+        except OSError:
+            print("Не удалось открыть отдельную папку профиля браузера.", file=sys.stderr)
+            return 2
+    else:
+        routes = ["proxy"] if args.proxy else ([args.family] if args.family in ("ipv4", "ipv6") else ["ipv4", "ipv6"])
+        if not args.json:
+            print("Проверяю %s. Лимит на запрос: %s с.\n" % (", ".join(routes), args.timeout), flush=True)
+        with tempfile.TemporaryDirectory(prefix="gemini-check-") as directory:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(routes)) as pool:
+                pending = [pool.submit(check_route, directory, route, args.proxy, key, args.timeout, args.model) for route in routes]
+                results = [future.result() for future in pending]
     report = {"schema_version": 1, "version": VERSION,
               "checked_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
               "results": results, "changes": []}
@@ -586,7 +1075,7 @@ def main():
     states = {r["assessment"]["status"] for r in results}
     if states.intersection(("restricted", "mixed")):
         return 1
-    if "api_confirmed" in states and states <= {"api_confirmed", "unreachable"}:
+    if states.intersection(("api_confirmed", "web_confirmed")) and states <= {"api_confirmed", "web_confirmed", "unreachable"}:
         return 0
     return 2
 
