@@ -165,6 +165,20 @@ if (mode === 'no_answer'""", 1)
         self.assertEqual(result["response_error"]["status"], "PERMISSION_DENIED", result)
         self.assertNotIn(SECRET, json.dumps(result) + self.output.getvalue())
 
+    def test_explicit_error_info_reaches_the_completed_browser_response(self):
+        error = {"error": {"code": 400, "status": "FAILED_PRECONDITION",
+                           "message": "Precondition check failed: session_id=private-session-123",
+                           "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                                        "reason": "ACCOUNT_NOT_ELIGIBLE", "domain": "google.com",
+                                        "metadata": {"private": SECRET}}]}}
+        self.load(fixture("modern_no_answer"), post_body=json.dumps(error))
+        result = self.probe(error_info=True)
+        self.assertEqual(result["status"], "site_error", result)
+        self.assertIn("Precondition check failed", result["response_error"]["message"])
+        self.assertEqual(result["response_error"]["reason"], "ACCOUNT_NOT_ELIGIBLE")
+        self.assertNotIn("private-session-123", json.dumps(result))
+        self.assertNotIn(SECRET, json.dumps(result))
+
     def test_webchannel_acknowledgement_number_is_not_a_permission_error(self):
         self.load(fixture("modern_no_answer"), post_body="8\n[0,0,7]\n", post_content_type="text/plain")
         result = self.probe()

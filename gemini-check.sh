@@ -117,7 +117,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
 
-VERSION = "2.7"
+VERSION = "2.8"
 BROWSER_PLAYWRIGHT_VERSION = "1.64.1"
 API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36"
@@ -539,13 +539,25 @@ RPC_STATUS_NAMES = ("OK", "CANCELLED", "UNKNOWN", "INVALID_ARGUMENT", "DEADLINE_
                     "UNAVAILABLE", "DATA_LOSS", "UNAUTHENTICATED")
 
 
-def _browser_rpc_error(body, content_type="", headers=None):
+def _browser_error_message(value):
+    value = str(value or "")
+    value = re.sub(r"https?://\S+", "[URL]", value, flags=re.I)
+    value = re.sub(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", "[email]", value, flags=re.I)
+    value = re.sub(r"(?i)\b(?:authorization|cookie|set-cookie|x-goog-api-key)\s*[:=]\s*[^\r\n]+", "[скрыто]", value)
+    value = re.sub(r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]+=*", "Bearer [скрыто]", value)
+    value = re.sub(r"(?i)\b(?:sid|hsid|ssid|apisid|sapisid|session(?:_?id)?|(?:access_|refresh_)?token|api_key)\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)", "[скрыто]", value)
+    value = re.sub(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b", "[скрыто]", value)
+    value = re.sub(r"\b[A-Za-z0-9_-]{32,}\b", "[идентификатор скрыт]", value)
+    return _browser_dialog_label(value)
+
+
+def _browser_rpc_error(body, content_type="", headers=None, include_message=False):
     """Decode explicit error envelopes; channel acknowledgements are not RPC codes."""
     if not isinstance(body, (bytes, bytearray)) or len(body) > 65536:
         return None
     headers = {str(key).lower(): str(value) for key, value in (headers or {}).items()}
 
-    def error_result(code, status, message, source):
+    def error_result(code, status, message, source, details=()):
         if not isinstance(code, int) or isinstance(code, bool) or code <= 0 or code > 599:
             return None
         canonical = RPC_STATUS_NAMES.index(status) if status in RPC_STATUS_NAMES else None
@@ -556,16 +568,44 @@ def _browser_rpc_error(body, content_type="", headers=None):
         if canonical is None:
             classification = ({401: "login_required", 403: "access_denied", 408: "timeout", 429: "quota"}.get(code)
                               or ("network_error" if 500 <= code <= 599 else "site_error"))
-        message = str(message or "").casefold().replace("’", "'")
+        raw_message = str(message or "")
+        reason, domain = "", ""
+        for item in details[:8] if isinstance(details, list) else ():
+            if (not isinstance(item, dict) or not isinstance(item.get("@type"), str)
+                    or item["@type"].rsplit("/", 1)[-1] != "google.rpc.ErrorInfo"):
+                continue
+            candidate = item.get("reason", "")
+            if isinstance(candidate, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{0,61}[A-Z0-9]", candidate):
+                reason = candidate
+            candidate = item.get("domain", "")
+            if isinstance(candidate, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]{0,126}[A-Za-z0-9]", candidate):
+                domain = candidate
+            break
+        message = raw_message.casefold().replace("’", "'")
         if any(value in message for value in ("user location is not supported", "not supported in your country",
                                              "gemini isn't available in your country", "gemini is not available in your country",
-                                             "not available in your region")):
+                                             "not available in your region")) or reason in (
+                "USER_LOCATION_NOT_SUPPORTED", "LOCATION_NOT_SUPPORTED", "COUNTRY_NOT_SUPPORTED", "UNSUPPORTED_REGION", "UNSUPPORTED_LOCATION"):
             classification = "region_blocked"
+        elif reason in ("AUTHENTICATION_REQUIRED", "LOGIN_REQUIRED", "UNAUTHENTICATED"):
+            classification = "login_required"
         detail = {"timeout": "Google превысил время ответа", "access_denied": "Google отказал в доступе; причина по IP не установлена",
                   "quota": "Google сообщил о лимите запросов", "login_required": "Google требует входа в аккаунт",
                   "network_error": "временная ошибка сервиса Google", "region_blocked": "Google явно сообщил о неподдерживаемом регионе",
                   "site_error": "Google не смог выполнить запрос"}[classification]
-        return {"source": source, "code": code, "status": status or "UNKNOWN", "classification": classification, "detail": detail}
+        if canonical == 9 and classification == "site_error":
+            detail = "не выполнено условие запроса"
+        if reason in ("SESSION_EXPIRED", "INVALID_SESSION") and classification == "site_error":
+            detail = "сессия браузера истекла или недействительна"
+        result = {"source": source, "code": code, "status": status or "UNKNOWN", "classification": classification, "detail": detail}
+        if include_message:
+            if raw_message:
+                result["message"] = _browser_error_message(raw_message)
+            if reason:
+                result["reason"] = reason
+            if domain:
+                result["domain"] = domain
+        return result
 
     def trailers(values, source):
         code = values.get("grpc-status", "")
@@ -648,7 +688,7 @@ def _browser_rpc_error(body, content_type="", headers=None):
             if isinstance(error, dict):
                 code, status = error.get("code"), error.get("status", "")
                 if isinstance(status, str):
-                    found = error_result(code, status if status in RPC_STATUS_NAMES else "", error.get("message"), source)
+                    found = error_result(code, status if status in RPC_STATUS_NAMES else "", error.get("message"), source, error.get("details"))
                     if found:
                         return found
             children = list(value.values())[:64]
@@ -796,7 +836,8 @@ class BrowserResponseMonitor:
             record["buffer"].extend(chunk[:remaining])
         try:
             headers = record["headers"] if record["eligible_headers"] else {}
-            error = _browser_rpc_error(bytes(record["buffer"]), record["content_type"], headers)
+            error = _browser_rpc_error(bytes(record["buffer"]), record["content_type"], headers,
+                                       include_message=bool(self.state.get("error_info")))
             if not error:
                 return
             key = (error.get("source"), error.get("code"), error.get("status"), error.get("classification"))
@@ -932,7 +973,7 @@ def _browser_keyboard_ready(composer, prompt):
     }""", prompt)
 
 
-def test_browser_page(page, timeout=60, nonce=None, interactive=False, dialog_info=False, page_info=False, response_monitor=None):
+def test_browser_page(page, timeout=60, nonce=None, interactive=False, dialog_info=False, page_info=False, response_monitor=None, error_info=False):
     """Test the already-open Gemini UI. No navigation, cookies or raw RPC are exported."""
     token = nonce or "CHECK_" + uuid.uuid4().hex[:20]
     result = {"status": "unknown", "detail": "", "submitted": False,
@@ -940,7 +981,7 @@ def test_browser_page(page, timeout=60, nonce=None, interactive=False, dialog_in
               "generation_http": 0, "stage": "detect_gate"}
     started = time.monotonic()
     deadline = started + max(0.1, timeout)
-    state = {"sending": False, "request_seen": False, "nonce_request_seen": False, "http": 0}
+    state = {"sending": False, "request_seen": False, "nonce_request_seen": False, "http": 0, "error_info": bool(error_info)}
     accepted_requests, finished_requests, failed_requests = set(), set(), set()
     completed_requests, rpc_errors = [], []
     # The browser session attaches CDP before navigation. Do not try attaching
@@ -1040,7 +1081,7 @@ def test_browser_page(page, timeout=60, nonce=None, interactive=False, dialog_in
                         continue
                     # This queue receives requestfinished only. Never wait for
                     # the body of an active or aborted streaming response.
-                    record_error(_browser_rpc_error(response.body(), headers.get("content-type", ""), headers))
+                    record_error(_browser_rpc_error(response.body(), headers.get("content-type", ""), headers, include_message=error_info))
                 except Exception:
                     pass
 
@@ -1545,7 +1586,7 @@ def _browser_proxy(proxy):
     return settings
 
 
-def _probe_browser_session(proxy="", timeout=60, headed=False, profile=None, dialog_info=False, page_info=False):
+def _probe_browser_session(proxy="", timeout=60, headed=False, profile=None, dialog_info=False, page_info=False, error_info=False):
     started = time.monotonic()
     deadline = started + timeout
     result = {"status": "unknown", "detail": "", "ip": "", "country": "", "colo": "", "warp": "",
@@ -1614,7 +1655,8 @@ def _probe_browser_session(proxy="", timeout=60, headed=False, profile=None, dia
                         print("Окно Gemini открыто. Если требуется, войдите вручную; проверка продолжится до истечения таймаута.", file=sys.stderr)
                     outcome = test_browser_page(page, timeout=max(0.1, deadline - time.monotonic()),
                                                 interactive=bool(headed and profile), dialog_info=bool(dialog_info and not profile),
-                                                page_info=bool(page_info and not profile), response_monitor=response_monitor)
+                                                page_info=bool(page_info and not profile), response_monitor=response_monitor,
+                                                error_info=bool(error_info and not profile))
                     result.update(outcome)
                     result["endpoint"] = _browser_endpoint(page.url)
                     if result["status"] == "unknown" and result["http"] == 403:
@@ -1650,9 +1692,11 @@ def _probe_browser_session(proxy="", timeout=60, headed=False, profile=None, dia
         result["elapsed"] = round(time.monotonic() - started, 2)
 
 
-def probe_browser(proxy="", timeout=60, headed=False, profile=None, ipv4=None, dialog_info=False, page_info=False):
+def probe_browser(proxy="", timeout=60, headed=False, profile=None, ipv4=None, dialog_info=False, page_info=False, error_info=False):
     force_ipv4 = not proxy if ipv4 is None else ipv4
     info_options = {"page_info": True} if page_info else {}
+    if error_info:
+        info_options["error_info"] = True
     if not force_ipv4:
         result = _probe_browser_session(proxy=proxy, timeout=timeout, headed=headed, profile=profile, dialog_info=dialog_info, **info_options)
         result["transport"] = {"family": "proxy" if proxy else "auto", "connections": [],
@@ -1872,7 +1916,8 @@ def check_browser_route(args):
     browser = probe_browser(proxy=args.proxy, timeout=args.browser_timeout,
                             headed=args.headed, profile=profile, ipv4=not bool(args.proxy),
                             dialog_info=getattr(args, "browser_dialog_info", False),
-                            **({"page_info": True} if getattr(args, "browser_page_info", False) else {}))
+                            **dict(({"page_info": True} if getattr(args, "browser_page_info", False) else {}),
+                                   **({"error_info": True} if getattr(args, "browser_error_info", False) else {})))
     status = browser["status"]
     if status == "working" and browser.get("response_verified") and browser.get("submitted"):
         assessment = {"status": "web_confirmed", "detail": "GEMINI WEB РАБОТАЕТ: получен новый ответ на тестовое сообщение через браузер"}
@@ -2109,7 +2154,12 @@ def _print_browser_brief(report):
             error = b.get("response_error")
             if error:
                 source = "gRPC" if error["source"].startswith("grpc") else "Gemini" if error["source"] == "gemini_ui" else "HTTP" if error["source"] == "http" else "Google"
-                print("Код: %s %s (%s). %s" % (source, error["code"], error["status"], error["detail"]))
+                explanation = error["detail"]
+                if error.get("reason"):
+                    explanation += " [" + error["reason"] + "]"
+                if error.get("message"):
+                    explanation += "; Google: " + error["message"]
+                print("Код: %s %s (%s). %s" % (source, error["code"], error["status"], explanation))
             elif b.get("error"):
                 error = b["error"]
                 print("Причина: %s [%s]" % (BROWSER_ERRORS.get(error["reason"], "ошибка проверки"), error["reason"]))
@@ -2148,6 +2198,10 @@ def print_report(report, verbose=False):
             if b.get("response_error"):
                 error = b["response_error"]
                 print("  Код ответа:   %s %s (%s)" % (error["source"], error["code"], error["status"]))
+                if error.get("message"):
+                    print("  Google:       " + error["message"])
+                if error.get("reason"):
+                    print("  Причина Google: " + error["reason"])
             diagnostics = b.get("diagnostics", {})
             sent = "отправлено" if b.get("submitted") else "отправка не подтверждена" if diagnostics.get("submit_attempted") else "не отправлено"
             print("  Сообщение:    %s | новый ответ проверен: %s" % (sent, "да" if b.get("response_verified") else "нет"))
@@ -2243,6 +2297,7 @@ def arguments():
     parser.add_argument("--browser-profile", metavar="DIR", help="отдельный профиль для ручного Google-входа; нужен --browser")
     parser.add_argument("--browser-dialog-info", action="store_true", help="показать заголовок и кнопки диалога в чистом браузере; нужен --browser")
     parser.add_argument("--browser-page-info", action="store_true", help="показать видимый текст сайта после проверки; только чистый браузер с --browser")
+    parser.add_argument("--browser-error-info", action="store_true", help="короткое сообщение и код причины Google; только чистый браузер с --browser")
     parser.add_argument("--key-file", help="прочитать ключ API из локального файла")
     parser.add_argument("--model", default="", help="модель для generateContent вместо автоматического выбора")
     parser.add_argument("--timeout", type=int, default=12, help="лимит секунд на HTTP-запрос, от 5 до 60 (12)")
@@ -2258,14 +2313,14 @@ def arguments():
         parser.error("--timeout должен быть от 5 до 60")
     if not 15 <= args.browser_timeout <= 300:
         parser.error("--browser-timeout должен быть от 15 до 300")
-    if args.install_browser and (args.browser or args.family or args.headed or args.browser_profile or args.browser_dialog_info or args.browser_page_info or args.json or args.save or args.compare or args.proxy or args.proxy_address):
+    if args.install_browser and (args.browser or args.family or args.headed or args.browser_profile or args.browser_dialog_info or args.browser_page_info or args.browser_error_info or args.json or args.save or args.compare or args.proxy or args.proxy_address):
         parser.error("--install-browser запускается отдельно от проверки")
     if args.browser and args.family not in (None, "ipv4"):
         parser.error("прямой браузерный тест работает через IPv4; --ipv6 и --both доступны только для curl")
-    if not args.browser and (args.headed or args.browser_profile or args.browser_dialog_info or args.browser_page_info):
+    if not args.browser and (args.headed or args.browser_profile or args.browser_dialog_info or args.browser_page_info or args.browser_error_info):
         parser.error("--headed, --browser-profile и диагностические флаги требуют --browser")
-    if (args.browser_dialog_info or args.browser_page_info) and args.browser_profile:
-        parser.error("--browser-dialog-info и --browser-page-info доступны только в чистом профиле, без --browser-profile")
+    if (args.browser_dialog_info or args.browser_page_info or args.browser_error_info) and args.browser_profile:
+        parser.error("диагностические флаги доступны только в чистом профиле, без --browser-profile")
     if args.browser and (args.key_file or args.model):
         parser.error("--browser работает без API: --key-file и --model здесь не используются")
     if args.browser_profile:
