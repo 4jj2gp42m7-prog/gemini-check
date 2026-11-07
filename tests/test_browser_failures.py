@@ -102,7 +102,7 @@ class BrowserFailureTests(unittest.TestCase):
         self.assertEqual(route["assessment"]["status"], "inconclusive", route)
         with contextlib.redirect_stdout(self.logs):
             self.namespace["print_report"]({"checked_at": "2026-11-07T00:00:00+00:00",
-                                            "results": [route]})
+                                            "results": [route]}, verbose=True)
         self.assertIn("page_crashed", self.logs.getvalue())
         self.assert_safe(result)
 
@@ -122,7 +122,7 @@ class BrowserFailureTests(unittest.TestCase):
         self.assertEqual(route["assessment"]["status"], "inconclusive", route)
         with contextlib.redirect_stdout(self.logs):
             self.namespace["print_report"]({"checked_at": "2026-11-07T00:00:00+00:00",
-                                            "results": [route]})
+                                            "results": [route]}, verbose=True)
         for text in ("Этап", "отправка сообщения", "blocked_by_overlay", "TimeoutError"):
             self.assertIn(text, self.logs.getvalue())
         self.assert_safe(result)

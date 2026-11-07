@@ -93,6 +93,8 @@ gemini_payload_dir=$(mktemp -d "${TMPDIR:-/tmp}/gemini-check.XXXXXXXX")
 trap 'rm -rf -- "$gemini_payload_dir"' EXIT
 cat > "$gemini_payload_dir/payload.py" <<'PYTHON_GEMINI_CHECK'
 import argparse
+import asyncio
+import base64
 import concurrent.futures
 import datetime
 import getpass
@@ -115,7 +117,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
 
-VERSION = "2.6"
+VERSION = "2.7"
 BROWSER_PLAYWRIGHT_VERSION = "1.64.1"
 API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36"
@@ -531,6 +533,331 @@ def _browser_assistants(page):
     return values
 
 
+RPC_STATUS_NAMES = ("OK", "CANCELLED", "UNKNOWN", "INVALID_ARGUMENT", "DEADLINE_EXCEEDED",
+                    "NOT_FOUND", "ALREADY_EXISTS", "PERMISSION_DENIED", "RESOURCE_EXHAUSTED",
+                    "FAILED_PRECONDITION", "ABORTED", "OUT_OF_RANGE", "UNIMPLEMENTED", "INTERNAL",
+                    "UNAVAILABLE", "DATA_LOSS", "UNAUTHENTICATED")
+
+
+def _browser_rpc_error(body, content_type="", headers=None):
+    """Decode explicit error envelopes; channel acknowledgements are not RPC codes."""
+    if not isinstance(body, (bytes, bytearray)) or len(body) > 65536:
+        return None
+    headers = {str(key).lower(): str(value) for key, value in (headers or {}).items()}
+
+    def error_result(code, status, message, source):
+        if not isinstance(code, int) or isinstance(code, bool) or code <= 0 or code > 599:
+            return None
+        canonical = RPC_STATUS_NAMES.index(status) if status in RPC_STATUS_NAMES else None
+        if status == "OK":
+            return None
+        classification = {4: "timeout", 7: "access_denied", 8: "quota", 16: "login_required",
+                          10: "network_error", 13: "network_error", 14: "network_error", 15: "network_error"}.get(canonical, "site_error")
+        if canonical is None:
+            classification = ({401: "login_required", 403: "access_denied", 408: "timeout", 429: "quota"}.get(code)
+                              or ("network_error" if 500 <= code <= 599 else "site_error"))
+        message = str(message or "").casefold().replace("’", "'")
+        if any(value in message for value in ("user location is not supported", "not supported in your country",
+                                             "gemini isn't available in your country", "gemini is not available in your country",
+                                             "not available in your region")):
+            classification = "region_blocked"
+        detail = {"timeout": "Google превысил время ответа", "access_denied": "Google отказал в доступе; причина по IP не установлена",
+                  "quota": "Google сообщил о лимите запросов", "login_required": "Google требует входа в аккаунт",
+                  "network_error": "временная ошибка сервиса Google", "region_blocked": "Google явно сообщил о неподдерживаемом регионе",
+                  "site_error": "Google не смог выполнить запрос"}[classification]
+        return {"source": source, "code": code, "status": status or "UNKNOWN", "classification": classification, "detail": detail}
+
+    def trailers(values, source):
+        code = values.get("grpc-status", "")
+        if not re.fullmatch(r"[0-9]{1,2}", code) or not 0 <= int(code) < len(RPC_STATUS_NAMES):
+            return None
+        return error_result(int(code), RPC_STATUS_NAMES[int(code)], unquote(values.get("grpc-message", "")), source)
+
+    if "grpc-status" in headers:
+        return trailers(headers, "grpc_headers")
+    content_type = str(content_type).lower()
+    if "grpc-web" in content_type:
+        data = bytes(body)
+        if "grpc-web-text" in content_type:
+            data = re.sub(rb"\s+", b"", data)
+            if len(data) % 4:
+                return None
+            try:
+                data = b"".join(base64.b64decode(data[index:index + 4], validate=True) for index in range(0, len(data), 4))
+            except (ValueError, base64.binascii.Error):
+                return None
+        offset = 0
+        while offset + 5 <= len(data):
+            flag, length = data[offset], int.from_bytes(data[offset + 1:offset + 5], "big")
+            end = offset + 5 + length
+            if flag not in (0, 128) or end > len(data):
+                return None
+            if flag == 128:
+                if end != len(data):
+                    return None
+                try:
+                    values = dict(line.split(":", 1) for line in data[offset + 5:end].decode("ascii").splitlines() if ":" in line)
+                except (UnicodeError, ValueError):
+                    return None
+                return trailers({key.strip().lower(): value.strip() for key, value in values.items()}, "grpc_web")
+            offset = end
+        return None
+
+    try:
+        text = bytes(body).decode("utf-8-sig")
+    except UnicodeDecodeError as error:
+        if error.reason != "unexpected end of data":
+            return None
+        text = bytes(body[:error.start]).decode("utf-8-sig")
+    if text.startswith(")]}'"):
+        text = text[4:].lstrip("\r\n")
+    documents, source = [], "google_json"
+    try:
+        documents.append(json.loads(text))
+    except (ValueError, TypeError):
+        # WebChannel uses decimal lengths measured in JS UTF-16 code units.
+        # A partial final chunk is allowed while observing an active stream.
+        source, cursor = "webchannel_json", 0
+        for _ in range(32):
+            cursor += len(text[cursor:]) - len(text[cursor:].lstrip("\r\n "))
+            line = text.find("\n", cursor)
+            if line < 0 or not re.fullmatch(r"[0-9]{1,6}", text[cursor:line]):
+                break
+            length, start = int(text[cursor:line]), line + 1
+            if length <= 0 or length > 65536:
+                break
+            end, units = start, 0
+            while end < len(text) and units < length:
+                units += 2 if ord(text[end]) > 65535 else 1
+                end += 1
+            if units != length:
+                break
+            try:
+                documents.append(json.loads(text[start:end]))
+            except (ValueError, TypeError):
+                break
+            cursor = end
+    visited = [0]
+
+    def inspect(value, depth=0):
+        visited[0] += 1
+        if depth > 8 or visited[0] > 512:
+            return None
+        if isinstance(value, dict):
+            error = value.get("error")
+            if isinstance(error, dict):
+                code, status = error.get("code"), error.get("status", "")
+                if isinstance(status, str):
+                    found = error_result(code, status if status in RPC_STATUS_NAMES else "", error.get("message"), source)
+                    if found:
+                        return found
+            children = list(value.values())[:64]
+        elif isinstance(value, list):
+            children = value[:64]
+        else:
+            return None
+        for child in children:
+            found = inspect(child, depth + 1)
+            if found:
+                return found
+        return None
+
+    for document in documents:
+        found = inspect(document)
+        if found:
+            return found
+    return None
+
+
+class BrowserResponseMonitor:
+    """Observe owned Chromium response streams without intercepting traffic."""
+    MAX_BYTES = 65536
+    MAX_REQUESTS = 16
+
+    def __init__(self, page, state):
+        self.state = state
+        self.errors = []
+        self.available = False
+        self._session = None
+        self._closed = False
+        self._records = {}
+        self._starts = {}
+        self._error_keys = set()
+        self._listeners = (("Network.requestWillBeSent", self._request),
+                           ("Network.responseReceived", self._response),
+                           ("Network.dataReceived", self._data))
+        try:
+            self._session = page.context.new_cdp_session(page)
+            for event, listener in self._listeners:
+                self._session.on(event, listener)
+            self._send("Network.enable", {"maxTotalBufferSize": self.MAX_BYTES * self.MAX_REQUESTS,
+                                                   "maxResourceBufferSize": self.MAX_BYTES})
+        except Exception:
+            self.close()
+
+    def _send(self, method, params):
+        session = self._session
+        if hasattr(session, "_sync") and hasattr(session, "_impl_obj"):
+            # Pinned Playwright's public CDP send has no timeout parameter.
+            return session._sync(asyncio.wait_for(session._impl_obj.send(method=method, params=params), timeout=2))
+        return session.send(method, params)
+
+    @staticmethod
+    def _detach(session):
+        if hasattr(session, "_sync") and hasattr(session, "_impl_obj"):
+            return session._sync(asyncio.wait_for(session._impl_obj.detach(), timeout=2))
+        return session.detach()
+
+    @staticmethod
+    def _target(url):
+        parsed = urlsplit(url)
+        return ((parsed.hostname == "geminiweb-pa.clients6.google.com" and parsed.path == "/v1/processSession")
+                or (parsed.hostname == "gemini.google.com" and "/StreamGenerate" in parsed.path))
+
+    @staticmethod
+    def _decode(value, limit):
+        if not isinstance(value, str) or limit <= 0:
+            return b""
+        # Decode at most one bounded prefix, including when CDP buffered more.
+        prefix = value[:((limit + 2) // 3) * 4]
+        return base64.b64decode(prefix, validate=True)[:limit]
+
+    def _request(self, event):
+        try:
+            request = event.get("request", {})
+            rid = event.get("requestId")
+            if (self._closed or not rid or not self._target(request.get("url", ""))
+                    or request.get("method") not in ("GET", "POST")):
+                return
+            if rid not in self._starts and len(self._starts) >= self.MAX_REQUESTS:
+                return
+            self._starts[rid] = bool(self.state.get("sending"))
+        except Exception:
+            pass
+
+    def _response(self, event):
+        try:
+            rid, response = event.get("requestId"), event.get("response", {})
+            if (self._closed or not rid or rid not in self._starts or rid in self._records
+                    or not self._target(response.get("url", "")) or len(self._records) >= self.MAX_REQUESTS):
+                return
+            headers = {str(key).lower(): str(value) for key, value in response.get("headers", {}).items()
+                       if str(key).lower() in ("content-type", "grpc-status", "grpc-message")}
+            record = {"ready": False, "queue": bytearray(), "buffer": bytearray(), "armed": False,
+                      "eligible_headers": self._starts[rid], "headers": headers,
+                      "content_type": headers.get("content-type", response.get("mimeType", ""))}
+            # Subscribe before requesting bufferedData: nested dataReceived events
+            # can run before this synchronous CDP command returns.
+            self._records[rid] = record
+            try:
+                reply = self._send("Network.streamResourceContent", {"requestId": rid})
+            except Exception as error:
+                self._records.pop(rid, None)
+                message = str(error).casefold()
+                if isinstance(error, (TimeoutError, asyncio.TimeoutError)) or any(value in message for value in ("wasn't found", "method not found", "-32601")):
+                    self.available = False
+                    self.close()
+                return
+            self.available = True
+            queued = bytes(record["queue"])
+            record["queue"].clear()
+            record["ready"] = True
+            # Old buffered bytes from a pre-submit request are not new evidence.
+            if record["eligible_headers"]:
+                self._append(record, self._decode(reply.get("bufferedData", ""), self.MAX_BYTES))
+            self._append(record, queued)
+        except Exception:
+            pass
+
+    def _data(self, event):
+        try:
+            record = self._records.get(event.get("requestId"))
+            if self._closed or record is None or not event.get("data"):
+                return
+            if not record["ready"]:
+                if self.state.get("sending"):
+                    remaining = self.MAX_BYTES - len(record["queue"])
+                    record["queue"].extend(self._decode(event["data"], remaining))
+                return
+            self._append(record, self._decode(event["data"], self.MAX_BYTES - len(record["buffer"])))
+        except Exception:
+            pass
+
+    def _append(self, record, chunk):
+        if not self.state.get("sending"):
+            record["armed"] = False
+            record["buffer"].clear()
+            return
+        if not record["armed"]:
+            record["armed"] = True
+            record["buffer"].clear()
+        remaining = self.MAX_BYTES - len(record["buffer"])
+        if remaining:
+            record["buffer"].extend(chunk[:remaining])
+        try:
+            headers = record["headers"] if record["eligible_headers"] else {}
+            error = _browser_rpc_error(bytes(record["buffer"]), record["content_type"], headers)
+            if not error:
+                return
+            key = (error.get("source"), error.get("code"), error.get("status"), error.get("classification"))
+            if key not in self._error_keys and len(self.errors) < self.MAX_REQUESTS:
+                self._error_keys.add(key)
+                self.errors.append(error)
+        except Exception:
+            pass
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        session, self._session = self._session, None
+        if session is not None:
+            for event, listener in self._listeners:
+                try:
+                    session.remove_listener(event, listener)
+                except Exception:
+                    pass
+            try:
+                self._detach(session)
+            except Exception:
+                pass
+        self._records.clear()
+        self._starts.clear()
+
+
+def _browser_notices(page):
+    values = {}
+    for selector in ('[role="alert"]', '[role="status"]', 'model-response', '.model-response-text'):
+        nodes = page.locator(selector)
+        for index in range(min(nodes.count(), 12)):
+            node = nodes.nth(index)
+            if not node.is_visible():
+                continue
+            text = " ".join(node.inner_text(timeout=500).casefold().replace("’", "'").split())
+            if any(value in text for value in ("something went wrong", "что-то пошло не так")):
+                code = re.search(r"\(([0-9]{1,4})\)", text)
+                values[(selector, index)] = {"kind": "generic_error", "code": int(code.group(1)) if code else None}
+            elif any(value in text for value in ("couldn't generate", "couldn't respond", "can't respond right now")):
+                values[(selector, index)] = {"kind": "response_unavailable", "code": None}
+    return values
+
+
+def _browser_page_info(page, token):
+    """Explicit fresh-profile diagnostic, never a source of success evidence."""
+    try:
+        snapshot = page.locator("body").evaluate("""(body, token) => {
+            const visible = el => { const r=el.getBoundingClientRect(); return r.width>0 && r.height>0 && getComputedStyle(el).visibility!=='hidden'; };
+            const answers = [...body.querySelectorAll('model-response message-content,model-response .model-response-text,[data-message-author-role="model"] message-content,model-response,.model-response-text')].filter(visible);
+            const users = [...body.querySelectorAll('user-query,.user-query-content,[data-message-author-role="user"]')].filter(visible);
+            return {text:body.innerText, user_query_seen:users.some(el=>el.innerText.includes(token)),
+                    known_assistant_count:answers.length, known_nonce_found:answers.some(el=>el.innerText.includes(token))};
+        }""", token, timeout=1000)
+        snapshot["lines"] = [_browser_dialog_label(line) for line in snapshot.pop("text").splitlines() if line.strip()][-30:]
+        return snapshot
+    except Exception:
+        return {"unavailable": True}
+
+
 def _browser_manual_resume(page, deadline):
     print("Gemini запросил вход или согласие. Выполните действие вручную в открытом окне.", file=sys.stderr)
     while time.monotonic() < deadline:
@@ -605,7 +932,7 @@ def _browser_keyboard_ready(composer, prompt):
     }""", prompt)
 
 
-def test_browser_page(page, timeout=60, nonce=None, interactive=False, dialog_info=False):
+def test_browser_page(page, timeout=60, nonce=None, interactive=False, dialog_info=False, page_info=False, response_monitor=None):
     """Test the already-open Gemini UI. No navigation, cookies or raw RPC are exported."""
     token = nonce or "CHECK_" + uuid.uuid4().hex[:20]
     result = {"status": "unknown", "detail": "", "submitted": False,
@@ -614,6 +941,13 @@ def test_browser_page(page, timeout=60, nonce=None, interactive=False, dialog_in
     started = time.monotonic()
     deadline = started + max(0.1, timeout)
     state = {"sending": False, "request_seen": False, "nonce_request_seen": False, "http": 0}
+    accepted_requests, finished_requests, failed_requests = set(), set(), set()
+    completed_requests, rpc_errors = [], []
+    # The browser session attaches CDP before navigation. Do not try attaching
+    # a new session to an already crashed page during an outcome check.
+    monitor = response_monitor
+    if monitor is not None:
+        monitor.state = state
     diagnostics = {"editor_found": False, "editor_filled": False, "submit_attempted": False}
     composer, last_gate = None, ("", "")
     try:
@@ -654,6 +988,7 @@ def test_browser_page(page, timeout=60, nonce=None, interactive=False, dialog_in
 
         result["stage"] = "snapshot_answers"
         before = _browser_assistants(page)
+        notices_before = _browser_notices(page)
         if token in page.content() or any(token in text for text in before.values()):
             result["detail"] = "контрольный маркер уже был на странице до отправки; свежий ответ не подтверждён"
             return result
@@ -674,7 +1009,40 @@ def test_browser_page(page, timeout=60, nonce=None, interactive=False, dialog_in
             except Exception:
                 return False
 
-        accepted_requests = set()
+        def is_backend_get(request):
+            endpoint = urlsplit(request.url)
+            return (request.method == "GET" and endpoint.hostname == "geminiweb-pa.clients6.google.com"
+                    and endpoint.path == "/v1/processSession")
+
+        def record_error(error):
+            if error and error not in rpc_errors and len(rpc_errors) < 16:
+                rpc_errors.append(error)
+
+        def collect_errors():
+            if monitor is not None:
+                for error in monitor.errors:
+                    record_error(error)
+            while completed_requests:
+                request = completed_requests.pop(0)
+                try:
+                    response = request.response()
+                    if response is None:
+                        continue
+                    try:
+                        size = request.sizes().get("responseBodySize", 0)
+                    except Exception:
+                        size = 0
+                    if size > 65536:
+                        continue
+                    headers = response.headers
+                    length = headers.get("content-length", "")
+                    if length.isdigit() and int(length) > 65536:
+                        continue
+                    # This queue receives requestfinished only. Never wait for
+                    # the body of an active or aborted streaming response.
+                    record_error(_browser_rpc_error(response.body(), headers.get("content-type", ""), headers))
+                except Exception:
+                    pass
 
         def sent(request):
             if is_probe_request(request):
@@ -682,18 +1050,39 @@ def test_browser_page(page, timeout=60, nonce=None, interactive=False, dialog_in
                 state["request_seen"] = True
                 if urlsplit(request.url).hostname == "gemini.google.com":
                     state["nonce_request_seen"] = True
+            elif state["sending"] and is_backend_get(request):
+                accepted_requests.add(request)
 
         def received(response):
             # A pre-submit background request can finish after our action starts.
             # Correlate to the request event instead of reclassifying its response.
             if response.request in accepted_requests:
-                state["request_seen"] = True
+                if is_probe_request(response.request):
+                    state["request_seen"] = True
                 state["http"] = response.status
+                if response.status >= 400:
+                    error = _browser_rpc_error(json.dumps({"error": {"code": response.status}}).encode("utf-8"))
+                    if error:
+                        error.update(source="http", status="HTTP_ERROR")
+                        record_error(error)
                 if urlsplit(response.request.url).hostname == "gemini.google.com":
                     state["nonce_request_seen"] = True
 
+        def finished(request):
+            if request in accepted_requests or (state["sending"] and is_backend_get(request)):
+                accepted_requests.add(request)
+                finished_requests.add(request)
+                if len(completed_requests) < 16:
+                    completed_requests.append(request)
+
+        def failed(request):
+            if request in accepted_requests:
+                failed_requests.add(request)
+
         page.on("request", sent)
         page.on("response", received)
+        page.on("requestfinished", finished)
+        page.on("requestfailed", failed)
         try:
             result["stage"] = "fill_editor"
             composer.fill(prompt, timeout=max(100, int((deadline - time.monotonic()) * 1000)))
@@ -784,6 +1173,7 @@ def test_browser_page(page, timeout=60, nonce=None, interactive=False, dialog_in
             result["stage"] = "wait_answer"
             while time.monotonic() < deadline:
                 result["request_seen"], result["generation_http"] = state["request_seen"], state["http"]
+                collect_errors()
                 if _browser_handle_dialogs(page, deadline, result, diagnostics, dialog_info):
                     continue
                 gate = _browser_gate(page)
@@ -804,13 +1194,13 @@ def test_browser_page(page, timeout=60, nonce=None, interactive=False, dialog_in
                                 return resumed
                         result.update(status="login_required", detail="после отправки сайт потребовал входа в Google")
                         return result
-                if state["http"] == 429:
+                if state["nonce_request_seen"] and state["http"] == 429:
                     result.update(status="quota", detail="запрос веб-чата получил HTTP 429; работа не подтверждена")
                     return result
-                if state["http"] == 403:
+                if state["nonce_request_seen"] and state["http"] == 403:
                     result.update(status="access_denied", detail="запрос веб-чата получил HTTP 403; причина отказа по IP не установлена")
                     return result
-                if state["http"] >= 500:
+                if state["nonce_request_seen"] and state["http"] >= 500:
                     result.update(status="network_error", detail="Google вернул временную ошибку HTTP %s" % state["http"])
                     return result
                 for identity, text in _browser_assistants(page).items():
@@ -820,7 +1210,25 @@ def test_browser_page(page, timeout=60, nonce=None, interactive=False, dialog_in
                                       stage="complete",
                                       detail="после отправки сообщения получен новый ответ модели с контрольным маркером; Gemini WEB работает сейчас")
                         return result
+                for identity, code in _browser_notices(page).items():
+                    if notices_before.get(identity) != code:
+                        collect_errors()
+                        if rpc_errors:
+                            error = rpc_errors[-1]
+                            result.update(status=error["classification"], response_error=error, detail=error["detail"])
+                        else:
+                            result.update(status="site_error", ui_error=code["kind"],
+                                          detail="после отправки сайт показал ошибку; причина ограничения по IP не установлена")
+                            if code["code"] is not None:
+                                result["response_error"] = {"source": "gemini_ui", "code": code["code"], "status": "SITE_ERROR",
+                                                            "classification": "site_error", "detail": "Gemini сообщил об ошибке приложения"}
+                        return result
                 page.wait_for_timeout(250)
+            collect_errors()
+            if rpc_errors:
+                error = rpc_errors[-1]
+                result.update(status=error["classification"], response_error=error, detail=error["detail"])
+                return result
             if action_error is not None:
                 result["stage"] = "submit"
                 raise action_error
@@ -836,7 +1244,8 @@ def test_browser_page(page, timeout=60, nonce=None, interactive=False, dialog_in
             # can establish that our message was submitted.
             if state["nonce_request_seen"]:
                 result["submitted"] = True
-            for event, listener in (("request", sent), ("response", received)):
+            for event, listener in (("request", sent), ("response", received),
+                                    ("requestfinished", finished), ("requestfailed", failed)):
                 try:
                     page.remove_listener(event, listener)
                 except Exception:
@@ -856,6 +1265,14 @@ def test_browser_page(page, timeout=60, nonce=None, interactive=False, dialog_in
             result.update(status="unknown", detail="ошибка работы с интерфейсом Gemini; этап и код указаны ниже")
         return result
     finally:
+        result["response_monitor_available"] = bool(monitor is not None and monitor.available)
+        if rpc_errors:
+            result["rpc_errors"] = rpc_errors
+        result["backend_requests"] = {"total": len(accepted_requests), "finished": len(finished_requests),
+                                      "failed": len(failed_requests),
+                                      "pending": len(accepted_requests - finished_requests - failed_requests)}
+        if page_info and result.get("error", {}).get("reason") != "navigation_interrupted":
+            result["page_info"] = _browser_page_info(page, token)
         result["diagnostics"] = diagnostics
         result["elapsed_ms"] = max(0, int((time.monotonic() - started) * 1000))
 
@@ -1128,7 +1545,7 @@ def _browser_proxy(proxy):
     return settings
 
 
-def _probe_browser_session(proxy="", timeout=60, headed=False, profile=None, dialog_info=False):
+def _probe_browser_session(proxy="", timeout=60, headed=False, profile=None, dialog_info=False, page_info=False):
     started = time.monotonic()
     deadline = started + timeout
     result = {"status": "unknown", "detail": "", "ip": "", "country": "", "colo": "", "warp": "",
@@ -1146,7 +1563,7 @@ def _probe_browser_session(proxy="", timeout=60, headed=False, profile=None, dia
         return result
     environment = {k: v for k, v in os.environ.items()
                    if k not in PROXY_ENV + ("GEMINI_KEY", "GEMINI_PROXY")}
-    browser, context = None, None
+    browser, context, response_monitor = None, None, None
     try:
         with sync_playwright() as playwright:
             launch = {"headless": not headed, "env": environment,
@@ -1183,6 +1600,7 @@ def _probe_browser_session(proxy="", timeout=60, headed=False, profile=None, dia
                 finally:
                     trace.close()
                 page = context.new_page()
+                response_monitor = BrowserResponseMonitor(page, {"sending": False})
                 try:
                     response = page.goto("https://gemini.google.com/app?hl=en", wait_until="domcontentloaded",
                                          timeout=max(500, int(min(30, max(0, deadline - time.monotonic())) * 1000)))
@@ -1195,7 +1613,8 @@ def _probe_browser_session(proxy="", timeout=60, headed=False, profile=None, dia
                     if headed and profile:
                         print("Окно Gemini открыто. Если требуется, войдите вручную; проверка продолжится до истечения таймаута.", file=sys.stderr)
                     outcome = test_browser_page(page, timeout=max(0.1, deadline - time.monotonic()),
-                                                interactive=bool(headed and profile), dialog_info=bool(dialog_info and not profile))
+                                                interactive=bool(headed and profile), dialog_info=bool(dialog_info and not profile),
+                                                page_info=bool(page_info and not profile), response_monitor=response_monitor)
                     result.update(outcome)
                     result["endpoint"] = _browser_endpoint(page.url)
                     if result["status"] == "unknown" and result["http"] == 403:
@@ -1212,6 +1631,8 @@ def _probe_browser_session(proxy="", timeout=60, headed=False, profile=None, dia
                     result.update(status="network_error", detail=note)
                     return result
             finally:
+                if response_monitor is not None:
+                    response_monitor.close()
                 if context is not None:
                     try:
                         context.close()
@@ -1229,10 +1650,11 @@ def _probe_browser_session(proxy="", timeout=60, headed=False, profile=None, dia
         result["elapsed"] = round(time.monotonic() - started, 2)
 
 
-def probe_browser(proxy="", timeout=60, headed=False, profile=None, ipv4=None, dialog_info=False):
+def probe_browser(proxy="", timeout=60, headed=False, profile=None, ipv4=None, dialog_info=False, page_info=False):
     force_ipv4 = not proxy if ipv4 is None else ipv4
+    info_options = {"page_info": True} if page_info else {}
     if not force_ipv4:
-        result = _probe_browser_session(proxy=proxy, timeout=timeout, headed=headed, profile=profile, dialog_info=dialog_info)
+        result = _probe_browser_session(proxy=proxy, timeout=timeout, headed=headed, profile=profile, dialog_info=dialog_info, **info_options)
         result["transport"] = {"family": "proxy" if proxy else "auto", "connections": [],
                                "failures": 0, "google_ipv4_confirmed": False}
         return result
@@ -1243,7 +1665,7 @@ def probe_browser(proxy="", timeout=60, headed=False, profile=None, ipv4=None, d
                               "google_ipv4_confirmed": False}}
     try:
         with IPv4BrowserProxy() as relay:
-            result = _probe_browser_session(proxy=relay.server_url, timeout=timeout, headed=headed, profile=profile, dialog_info=dialog_info)
+            result = _probe_browser_session(proxy=relay.server_url, timeout=timeout, headed=headed, profile=profile, dialog_info=dialog_info, **info_options)
             transport = relay.snapshot()
             google = [c for c in transport["connections"] if c["host"] in
                       ("gemini.google.com", "geminiweb-pa.clients6.google.com")]
@@ -1449,7 +1871,8 @@ def check_browser_route(args):
         profile = str(path)
     browser = probe_browser(proxy=args.proxy, timeout=args.browser_timeout,
                             headed=args.headed, profile=profile, ipv4=not bool(args.proxy),
-                            dialog_info=getattr(args, "browser_dialog_info", False))
+                            dialog_info=getattr(args, "browser_dialog_info", False),
+                            **({"page_info": True} if getattr(args, "browser_page_info", False) else {}))
     status = browser["status"]
     if status == "working" and browser.get("response_verified") and browser.get("submitted"):
         assessment = {"status": "web_confirmed", "detail": "GEMINI WEB РАБОТАЕТ: получен новый ответ на тестовое сообщение через браузер"}
@@ -1650,6 +2073,7 @@ API_LABELS = {"working": "РАБОТАЕТ", "not_checked": "НЕ ПРОВЕРЕ
               "model_missing": "МОДЕЛЬ НЕДОСТУПНА", "api_error": "ОШИБКА API"}
 
 BROWSER_LABELS = {"working": "ОТВЕЧАЕТ", "region_blocked": "ОТКАЗ ПО РЕГИОНУ",
+                  "site_error": "ОШИБКА НА САЙТЕ GEMINI",
                   "login_required": "ТРЕБУЕТСЯ ВХОД", "challenge": "ПРОВЕРКА GOOGLE / CAPTCHA",
                   "consent": "ТРЕБУЕТСЯ СОГЛАСИЕ", "quota": "ЛИМИТ ЗАПРОСОВ", "timeout": "ТАЙМАУТ",
                   "network_error": "ОШИБКА СЕТИ", "dependency_missing": "НУЖНА УСТАНОВКА БРАУЗЕРА",
@@ -1675,7 +2099,42 @@ BROWSER_KEYBOARD = {"editor_unavailable": "редактор недоступен
                     "suggestions_open": "открыты подсказки или меню", "editor_covered": "редактор тоже перекрыт"}
 
 
-def print_report(report):
+def _print_browser_brief(report):
+    for item in report["results"]:
+        b = item["browser"]
+        print("IP: %s (%s)" % (item["ip"] or "не определён", b.get("country") or "?"))
+        confirmed = b.get("status") == "working" and b.get("response_verified") and b.get("submitted")
+        print("Gemini: %s" % ("РАБОТАЕТ" if confirmed else BROWSER_LABELS.get(b["status"], "НЕ ПОДТВЕРЖДЕНО")))
+        if not confirmed:
+            error = b.get("response_error")
+            if error:
+                source = "gRPC" if error["source"].startswith("grpc") else "Gemini" if error["source"] == "gemini_ui" else "HTTP" if error["source"] == "http" else "Google"
+                print("Код: %s %s (%s). %s" % (source, error["code"], error["status"], error["detail"]))
+            elif b.get("error"):
+                error = b["error"]
+                print("Причина: %s [%s]" % (BROWSER_ERRORS.get(error["reason"], "ошибка проверки"), error["reason"]))
+            elif b["status"] == "timeout":
+                print("HTTP %s; ответ модели не получен. Код ошибки не найден." % (b.get("generation_http") or "не получен"))
+            else:
+                print(clean(b.get("detail"), limit=220))
+        for dialog in b.get("dialogs", []):
+            print("Окно: %s | %s" % (dialog.get("heading") or "без заголовка", " | ".join(dialog.get("buttons", []))))
+        info = b.get("page_info")
+        if info:
+            print("Текст сайта:")
+            for line in info.get("lines", ["недоступен"]):
+                print("  " + line)
+    if "compared_at" in report:
+        if not report.get("changes"):
+            print("Изменений нет.")
+        for change in report.get("changes", []):
+            print("%s: %s -> %s" % (change["field"], change["before"] or "?", change["after"] or "?"))
+
+
+def print_report(report, verbose=False):
+    if not verbose and all(item["id"] == "browser" for item in report["results"]):
+        _print_browser_brief(report)
+        return
     print("gemini-check %s | %s" % (VERSION, report["checked_at"]))
     browser_mode = any(item["id"] == "browser" for item in report["results"])
     print("Проверка обычного веб-чата через Chromium, без API." if browser_mode else "Проверка IP и маршрута. WEB и API оцениваются отдельно.")
@@ -1686,6 +2145,9 @@ def print_report(report):
             print("\nChromium | %s | внешний IP: %s" % (mode, item["ip"] or "не определён"))
             print("  Cloudflare:   страна %s | узел %s | WARP %s" % (b.get("country") or "?", b.get("colo") or "?", b.get("warp") or "?"))
             print("  Gemini WEB:   %s: %s" % (BROWSER_LABELS.get(b["status"], b["status"]), b["detail"]))
+            if b.get("response_error"):
+                error = b["response_error"]
+                print("  Код ответа:   %s %s (%s)" % (error["source"], error["code"], error["status"]))
             diagnostics = b.get("diagnostics", {})
             sent = "отправлено" if b.get("submitted") else "отправка не подтверждена" if diagnostics.get("submit_attempted") else "не отправлено"
             print("  Сообщение:    %s | новый ответ проверен: %s" % (sent, "да" if b.get("response_verified") else "нет"))
@@ -1703,6 +2165,20 @@ def print_report(report):
             if b.get("stage") and not b.get("response_verified"):
                 print("  Этап:         %s | прошло %.1f с" % (BROWSER_STAGES.get(b["stage"], "неизвестен"), b.get("elapsed_ms", 0) / 1000))
                 print("  Запрос Google: %s | HTTP %s" % ("замечен" if b.get("request_seen") else "не замечен", b.get("generation_http") or "не получен"))
+                requests = b.get("backend_requests")
+                if requests:
+                    print("  Запросы WEB:  всего %s | завершены %s | ошибок %s | ещё открыты %s" %
+                          (requests["total"], requests["finished"], requests["failed"], requests["pending"]))
+            if b.get("page_info"):
+                info = b["page_info"]
+                if info.get("unavailable"):
+                    print("  Текст сайта:  недоступен")
+                else:
+                    print("  На странице: сообщение видно: %s | контейнеров ответа: %s" %
+                          ("да" if info["user_query_seen"] else "нет", info["known_assistant_count"]))
+                    print("  Текст сайта:")
+                    for line in info["lines"]:
+                        print("    " + line)
             if b.get("error"):
                 error = b["error"]
                 print("  Причина:      %s [%s; %s]" % (BROWSER_ERRORS.get(error["reason"], "ошибка проверки"), error["reason"], error["type"]))
@@ -1766,10 +2242,12 @@ def arguments():
     parser.add_argument("--headed", action="store_true", help="показать окно Chromium (нужен --browser и графический экран)")
     parser.add_argument("--browser-profile", metavar="DIR", help="отдельный профиль для ручного Google-входа; нужен --browser")
     parser.add_argument("--browser-dialog-info", action="store_true", help="показать заголовок и кнопки диалога в чистом браузере; нужен --browser")
+    parser.add_argument("--browser-page-info", action="store_true", help="показать видимый текст сайта после проверки; только чистый браузер с --browser")
     parser.add_argument("--key-file", help="прочитать ключ API из локального файла")
     parser.add_argument("--model", default="", help="модель для generateContent вместо автоматического выбора")
     parser.add_argument("--timeout", type=int, default=12, help="лимит секунд на HTTP-запрос, от 5 до 60 (12)")
     parser.add_argument("--json", action="store_true", help="вывести только JSON; ключ не запрашивается")
+    parser.add_argument("--verbose", action="store_true", help="подробный браузерный отчёт вместо краткого итога")
     parser.add_argument("--save", metavar="FILE", help="сохранить JSON-снимок без ключа и адреса прокси")
     parser.add_argument("--compare", metavar="FILE", help="сравнить с предыдущим JSON-снимком")
     parser.add_argument("--version", action="version", version=VERSION)
@@ -1780,14 +2258,14 @@ def arguments():
         parser.error("--timeout должен быть от 5 до 60")
     if not 15 <= args.browser_timeout <= 300:
         parser.error("--browser-timeout должен быть от 15 до 300")
-    if args.install_browser and (args.browser or args.family or args.headed or args.browser_profile or args.browser_dialog_info or args.json or args.save or args.compare or args.proxy or args.proxy_address):
+    if args.install_browser and (args.browser or args.family or args.headed or args.browser_profile or args.browser_dialog_info or args.browser_page_info or args.json or args.save or args.compare or args.proxy or args.proxy_address):
         parser.error("--install-browser запускается отдельно от проверки")
     if args.browser and args.family not in (None, "ipv4"):
         parser.error("прямой браузерный тест работает через IPv4; --ipv6 и --both доступны только для curl")
-    if not args.browser and (args.headed or args.browser_profile or args.browser_dialog_info):
-        parser.error("--headed, --browser-profile и --browser-dialog-info требуют --browser")
-    if args.browser_dialog_info and args.browser_profile:
-        parser.error("--browser-dialog-info доступен только в чистом профиле, без --browser-profile")
+    if not args.browser and (args.headed or args.browser_profile or args.browser_dialog_info or args.browser_page_info):
+        parser.error("--headed, --browser-profile и диагностические флаги требуют --browser")
+    if (args.browser_dialog_info or args.browser_page_info) and args.browser_profile:
+        parser.error("--browser-dialog-info и --browser-page-info доступны только в чистом профиле, без --browser-profile")
     if args.browser and (args.key_file or args.model):
         parser.error("--browser работает без API: --key-file и --model здесь не используются")
     if args.browser_profile:
@@ -1878,7 +2356,7 @@ def main():
             print("Не удалось запустить подготовленное окружение браузера. Проверка Gemini не выполнялась.", file=sys.stderr)
             return 2
     if args.browser:
-        if not args.json:
+        if not args.json and args.verbose:
             mode = "через внешний прокси" if args.proxy else "через IPv4"
             print("Проверяю обычный Gemini через Chromium %s. Лимит: %s с.\n" % (mode, args.browser_timeout), flush=True)
         try:
@@ -1910,7 +2388,7 @@ def main():
     if args.json:
         print(content)
     else:
-        print_report(report)
+        print_report(report, verbose=args.verbose)
     states = {r["assessment"]["status"] for r in results}
     if states.intersection(("restricted", "mixed")):
         return 1
